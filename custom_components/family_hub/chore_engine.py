@@ -57,6 +57,7 @@ from .const import (
     CHORE_KEY_COMPLETED_BY,
     CHORE_KEY_GROUP_ID,
     CHORE_KEY_IMPORTANT,
+    CHORE_KEY_IN_PROGRESS,
     CHORE_KEY_NO_APPROVAL_REQUIRED,
     CHORE_KEY_OVERDUE_PENALTY_APPLIED,
     CHORE_KEY_QUANTITY_REMAINING,
@@ -429,6 +430,7 @@ def default_chore(**overrides: Any) -> dict[str, Any]:
         CHORE_KEY_QUANTITY_TOTAL: None,
         CHORE_KEY_QUANTITY_REMAINING: None,
         CHORE_KEY_IMPORTANT: False,
+        CHORE_KEY_IN_PROGRESS: False,
         CHORE_KEY_GROUP_ID: None,
     }
     chore.update(overrides)
@@ -612,6 +614,12 @@ def assign_chore(
     _check_user_enabled(is_user_enabled, target)
     chore["assigned_to"] = target
     chore[CHORE_KEY_UPDATED_AT] = _now_iso()
+    # Household ask: "mark in progress" belongs to whoever's actually
+    # doing the chore right now - reassigning it to someone else means
+    # nobody's doing it yet, so clear a stale in_progress flag left over
+    # from the previous assignee rather than silently handing it to the
+    # new one.
+    chore[CHORE_KEY_IN_PROGRESS] = False
     _fire_chore_event(hass, chore, previous_status=CHORE_STATUS_OPEN, actor=actor, extra={"event": "assigned"})
     return chore
 
@@ -641,6 +649,37 @@ def claim_chore(
     chore["assigned_to"] = user_id
     chore[CHORE_KEY_UPDATED_AT] = _now_iso()
     _fire_chore_event(hass, chore, previous_status=CHORE_STATUS_OPEN, actor=user_id, extra={"event": "claimed"})
+    return chore
+
+
+def set_chore_in_progress(
+    chores: dict[str, dict[str, Any]],
+    hass: HomeAssistant,
+    chore_id: str,
+    actor: Optional[str],
+    in_progress: bool,
+) -> dict[str, Any]:
+    """Household ask, verbatim: "Chores should have a button to Mark in
+    progress also." Toggles CHORE_KEY_IN_PROGRESS - a lightweight,
+    reversible marker, NOT a new state-machine status (see this module's
+    own docstring diagram, which stays exactly open -> pending_
+    verification -> approved). Only valid while the chore is still
+    CHORE_STATUS_OPEN; once complete_chore moves it on, "in progress" is
+    meaningless and every exit from "open" (complete_chore, reject_chore's
+    redo, reset_recurring_chore's fresh occurrence, assign_chore's
+    reassignment) clears it back to False on its own - see each of their
+    own comments. Doesn't touch assigned_to, dependencies, or anything
+    else; purely a UI signal for "someone's actively working on this
+    right now" on the Chores card."""
+    chore = _get_chore(chores, chore_id)
+    if chore["status"] != CHORE_STATUS_OPEN:
+        raise ChoreError("not_open", "Only an open (not-yet-completed) chore can be marked in progress.")
+    chore[CHORE_KEY_IN_PROGRESS] = bool(in_progress)
+    chore[CHORE_KEY_UPDATED_AT] = _now_iso()
+    _fire_chore_event(
+        hass, chore, previous_status=CHORE_STATUS_OPEN, actor=actor,
+        extra={"event": "in_progress" if in_progress else "in_progress_cleared"},
+    )
     return chore
 
 
@@ -780,6 +819,9 @@ def complete_chore(
     chore[CHORE_KEY_COMPLETED_BY] = actor or chore.get("assigned_to")
     chore[CHORE_KEY_COMPLETED_AT] = _now_iso()
     chore[CHORE_KEY_UPDATED_AT] = chore[CHORE_KEY_COMPLETED_AT]
+    # "In progress" only means anything while the chore is still open -
+    # see set_chore_in_progress's own docstring.
+    chore[CHORE_KEY_IN_PROGRESS] = False
 
     if chore_skips_verification(chore, permissions):
         approver = actor or chore.get("assigned_to")
@@ -848,6 +890,8 @@ def reject_chore(
     chore["status"] = CHORE_STATUS_OPEN
     chore[CHORE_KEY_COMPLETED_BY] = None
     chore[CHORE_KEY_COMPLETED_AT] = None
+    # Bounced back to redo - starts fresh, not already "in progress."
+    chore[CHORE_KEY_IN_PROGRESS] = False
     chore[CHORE_KEY_REJECTED_BY] = rejecter
     chore[CHORE_KEY_REJECTED_AT] = _now_iso()
     reason = (reason or "").strip()
@@ -887,6 +931,8 @@ def reset_recurring_chore(chores: dict[str, dict[str, Any]], hass: HomeAssistant
     chore[CHORE_KEY_APPROVED_BY] = None
     chore[CHORE_KEY_APPROVED_AT] = None
     chore[CHORE_KEY_OVERDUE_PENALTY_APPLIED] = False
+    # A fresh occurrence hasn't been started by anyone yet.
+    chore[CHORE_KEY_IN_PROGRESS] = False
     # A quantity-based chore's next occurrence starts with the full count
     # again ("3 loads of laundry" every week, not "0 loads" forever after
     # the first cycle used them all up) - ordinary chores have

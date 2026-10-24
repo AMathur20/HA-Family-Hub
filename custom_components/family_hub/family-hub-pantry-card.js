@@ -22,19 +22,107 @@
 // the widened-alarm broadcast at all, so a kiosk whose dashboard shows
 // it silently never rang for anyone else's widened timer alarm. Kept
 // byte-identical to every other card's copy on purpose.
+// ---- Family Hub shared translation helper (v1.168.76) -------------------
+// __fhT(key, english, vars, mode) looks a string up in Home Assistant's
+// loaded "fh_ui" translations (translations/<language>.json → fh_ui.text.*)
+// and falls back to the English text written right here in the source.
+// vars fill %0%, %1%, ... placeholders. mode "h" escapes the translated
+// text (not the vars, which callers already prepared) for use inside HTML
+// markup or an attribute value. Identical copy in every Family Hub card and
+// in the Theme Builder panel - whichever loads first sets it up.
+// __fhSweep(root) re-translates markup that was drawn before the language
+// file finished loading (elements tagged data-fh-t / data-fh-title /
+// data-fh-placeholder / data-fh-aria / data-fh-alt), but only while they
+// still show the English original, so text a card later replaced with
+// something else is never overwritten.
+var __fhI18n = (window.__familyHubI18n = window.__familyHubI18n || { hass: null, fb: {}, loading: null, loaded: null });
+var __fhEsc = function (s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+};
+var __fhT = function (key, fb, vars, mode) {
+  var g = window.__familyHubI18n || __fhI18n;
+  if (g.fb[key] === undefined) g.fb[key] = fb;
+  var str = "";
+  try {
+    if (g.hass && typeof g.hass.localize === "function") str = g.hass.localize("component.family_hub.fh_ui." + key) || "";
+  } catch (e) {
+    str = "";
+  }
+  if (!str) str = fb;
+  if (mode === "h") str = __fhEsc(str);
+  if (vars) {
+    Object.keys(vars).forEach(function (k) {
+      var v = vars[k];
+      str = str.split("%" + k + "%").join(v === null || v === undefined ? "" : String(v));
+    });
+  }
+  return str;
+};
+var __fhUseHass = function (hass) {
+  if (hass && typeof hass.localize === "function") (window.__familyHubI18n || __fhI18n).hass = hass;
+};
+var __fhSweep = function (root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  var g = window.__familyHubI18n || __fhI18n;
+  root.querySelectorAll("[data-fh-t]").forEach(function (el) {
+    var key = el.getAttribute("data-fh-t");
+    var fb = g.fb[key];
+    if (fb === undefined) return;
+    var cur = (el.textContent || "").trim();
+    if (cur !== fb && cur !== el.__fhShown) return;
+    var next = __fhT(key, fb);
+    if (cur !== next) el.textContent = next;
+    el.__fhShown = next;
+  });
+  [["data-fh-title", "title"], ["data-fh-placeholder", "placeholder"], ["data-fh-aria", "aria-label"], ["data-fh-alt", "alt"]].forEach(function (pair) {
+    root.querySelectorAll("[" + pair[0] + "]").forEach(function (el) {
+      var key = el.getAttribute(pair[0]);
+      var fb = g.fb[key];
+      if (fb === undefined) return;
+      var cur = el.getAttribute(pair[1]);
+      var shownKey = "__fhShown_" + pair[1];
+      if (cur !== fb && cur !== el[shownKey]) return;
+      var next = __fhT(key, fb);
+      if (cur !== next) el.setAttribute(pair[1], next);
+      el[shownKey] = next;
+    });
+  });
+};
+// -------------------------------------------------------------------------
+
 if (!window.__familyHubTimerAlarm) {
+  // v1.168.74 (timer + alarm overhaul): the on-screen half of a Family Hub
+  // timer alarm - a full-screen "time's up" with a looping alarm sound that
+  // keeps going until someone taps Stop, shared by every Family Hub card on
+  // the page (one modal, one sound, appended to document.body).
+  //
+  // A screen rings when the backend's family_hub_timer_alarm_ring event
+  // says so: it's the screen that started the timer (origin_client_id =
+  // this tab's id), it's logged in as one of target_user_ids (the owner, a
+  // kiosk login on a "kiosks" alarm), or broadcast_all ("everyone"). The
+  // tab that started a timer also rings on its own the instant its local
+  // countdown reaches zero (check()), so there's no wait for the server.
+  // Several alarms at once each get their own row and Stop button. Stop
+  // here stops it everywhere (screens, phones, speakers).
   window.__familyHubTimerAlarm = (function () {
     let modalEl = null;
     let audioCtx = null;
     let beepHandle = null;
-    let activeUid = null;
-    // A timer's uid, once dismissed, stays dismissed - otherwise the very
-    // next poll's countdown tick (still <= 0 for a few more seconds until
-    // the backend's own sweep, up to TIMER_SWEEP_SECONDS later, actually
-    // removes it from family_hub/timers/list) would immediately re-open
-    // the modal a person just tapped Stop on. Unbounded but negligible: a
-    // few bytes per timer this ONE tab ever alarmed for in its lifetime.
+    const ringing = new Map(); // uid -> {title, body}
     const dismissedUids = new Set();
+    let lastHass = null;
+    function myClientId() {
+      try {
+        let id = sessionStorage.getItem("family_hub_client_id");
+        if (!id) {
+          id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          sessionStorage.setItem("family_hub_client_id", id);
+        }
+        return id;
+      } catch (e) {
+        return "";
+      }
+    }
     function ensureModal() {
       if (modalEl) return modalEl;
       modalEl = document.createElement("div");
@@ -45,28 +133,57 @@ if (!window.__familyHubTimerAlarm) {
         background: "rgba(20,16,8,0.78)",
       });
       modalEl.innerHTML =
-        '<div style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:38px 30px;max-width:360px;width:88vw;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
-        '<div style="font-size:48px;margin-bottom:12px;">&#9200;</div>' +
-        '<div class="fh-timer-alarm-title" style="font-size:1.3em;font-weight:800;margin-bottom:6px;"></div>' +
-        '<div style="font-size:14px;color:#96877a;margin-bottom:24px;">Time\'s up!</div>' +
-        '<button type="button" class="fh-timer-alarm-stop" style="min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;">Stop</button>' +
+        '<div class="fh-timer-alarm-box" role="alertdialog" aria-live="assertive" style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:30px 26px;max-width:400px;width:88vw;max-height:86vh;overflow:auto;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
+        '<div style="font-size:48px;margin-bottom:6px;">&#9200;</div>' +
+        ('<div data-fh-t="text.time_s_up" class="fh-timer-alarm-head" style="font-size:14px;color:#96877a;margin-bottom:14px;font-weight:700;">' + __fhT("text.time_s_up", "Time's up!", null, "h") + '</div>') +
+        '<div class="fh-timer-alarm-list" style="display:flex;flex-direction:column;gap:12px;"></div>' +
+        ('<button data-fh-t="text.stop_all" type="button" class="fh-timer-alarm-stop-all" style="display:none;margin-top:16px;min-height:46px;width:100%;border:2px solid #8f5a00;border-radius:14px;background:transparent;color:#8f5a00;font-size:16px;font-weight:800;cursor:pointer;">' + __fhT("text.stop_all", "Stop all", null, "h") + '</button>') +
         "</div>";
       document.body.appendChild(modalEl);
-      modalEl.querySelector(".fh-timer-alarm-stop").addEventListener("click", () => stop());
+      modalEl.addEventListener("click", (e) => {
+        const btn = e.target.closest && e.target.closest("button");
+        if (!btn) return;
+        if (btn.classList.contains("fh-timer-alarm-stop-all")) {
+          Array.from(ringing.keys()).forEach((uid) => stop(uid));
+        } else if (btn.dataset.uid) {
+          stop(btn.dataset.uid);
+        }
+      });
       return modalEl;
     }
-    // A plain oscillator beep via the Web Audio API - deliberately not a
-    // bundled sound file: no extra media asset for HACS/manual installs to
-    // ship or for a self-hosted install's network policy to worry about,
-    // and it sounds identical on every install.
-    //
-    // The original v1.119.0+ sound was one
-    // flat square-wave tone repeated once a second - metronomic, which is
-    // exactly what read as a countdown-bomb tick rather than an alarm. This
-    // plays a quick alternating two-pitch TRIPLET (a classic digital-alarm-
-    // clock trill) each cycle instead of a single tone, which is what
-    // actually reads as "alarm" to the ear - the alternating pitch is what
-    // a lone repeated tone can't give you, no matter how loud.
+    function render() {
+      const el = ensureModal();
+      if (!ringing.size) {
+        el.style.display = "none";
+        return;
+      }
+      const list = el.querySelector(".fh-timer-alarm-list");
+      list.innerHTML = "";
+      ringing.forEach((info, uid) => {
+        const row = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "fh-timer-alarm-title";
+        title.style.cssText = "font-size:1.3em;font-weight:800;margin-bottom:4px;overflow-wrap:anywhere;";
+        title.textContent = info.title || __fhT("text.timer", "Timer");
+        row.appendChild(title);
+        if (info.body) {
+          const body = document.createElement("div");
+          body.style.cssText = "font-size:14px;color:#6b5f52;margin-bottom:10px;overflow-wrap:anywhere;";
+          body.textContent = info.body;
+          row.appendChild(body);
+        }
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "fh-timer-alarm-stop";
+        btn.dataset.uid = uid;
+        btn.textContent = __fhT("text.stop", "Stop");
+        btn.style.cssText = "min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;";
+        row.appendChild(btn);
+        list.appendChild(row);
+      });
+      el.querySelector(".fh-timer-alarm-stop-all").style.display = ringing.size > 1 ? "" : "none";
+      el.style.display = "flex";
+    }
     function playBeep(atTime, freq) {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
@@ -80,10 +197,7 @@ if (!window.__familyHubTimerAlarm) {
       osc.start(atTime);
       osc.stop(atTime + 0.15);
     }
-    // Scheduled via Web Audio's own clock (osc.start(atTime)) rather than
-    // three back-to-back setTimeout calls, so the triplet's timing stays
-    // tight even if the main JS thread is briefly busy - it's the crisp,
-    // even spacing that makes it read as a trill instead of a stutter.
+    // A two-pitch alarm-clock trill via Web Audio (no sound file to ship).
     function beepOnce() {
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -91,57 +205,11 @@ if (!window.__familyHubTimerAlarm) {
         const now = audioCtx.currentTime;
         [[0, 1046], [0.15, 1318], [0.3, 1046]].forEach(([offset, freq]) => playBeep(now + offset, freq));
       } catch (e) {
-        // Autoplay blocked, or no Web Audio at all - the modal is still
-        // the primary alarm; sound is a bonus on top of it, not required.
+        // Autoplay blocked or no Web Audio - the modal is still the alarm.
       }
     }
-    // which hass connection to tell "dismiss this everywhere"
-    // when Stop is tapped - set by whichever card most recently called
-    // ring()/check() with one, since this singleton is shared across every
-    // card on the dashboard and any of them may have `hass` by now. Best-
-    // effort only (see stop() below): a same-tab-only local alarm (the
-    // original v1.119.0+ behavior this singleton already had) never had a
-    // server-side record to begin with, so the dismiss call below simply
-    // no-ops for it (ws_dismiss_timer_alarm pops a uid that was never
-    // registered - see its own docstring for why that's silent, not an
-    // error).
-    let lastHass = null;
-    function stop() {
-      if (activeUid) dismissedUids.add(activeUid);
-      const uid = activeUid;
-      activeUid = null;
-      if (beepHandle) {
-        clearInterval(beepHandle);
-        beepHandle = null;
-      }
-      if (modalEl) modalEl.style.display = "none";
-      // household's explicit choice - "first tap wins, from
-      // anyone" - so tapping Stop here also clears the alarm everywhere
-      // else (other kiosks, other people's phones-that-are-dashboards)
-      // rather than just silencing this one tab. No permission gate, by
-      // design.
-      if (uid && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
-        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
-      }
-    }
-    // This modal already outranks the screensaver's own overlay (z-index
-    // 2147483647 vs 2147483000, set in ensureModal() above), so it was
-    // always painting on top of it - but a screensaver left running
-    // underneath still means its video/camera poll keeps going, so it
-    // needs to actually END, not just be covered up.
-    // There are THREE independent screensaver implementations in this
-    // project (the calendar card's own, the shared window.__familyHub
-    // ScreenSaver controller used by Chores/Rewards/My Chores/etc., and the
-    // standalone family-screensaver-card.js) and this singleton has no
-    // reference to whichever one might be running on this particular
-    // dashboard. Rather than importing all three, every one of them marks
-    // its overlay element with the same data-family-hub-screensaver
-    // attribute and already dismisses itself (hides, stops video/camera
-    // polling, navigates to its configured return dashboard) on its own
-    // overlay's "pointerdown" listener - so a synthetic pointerdown on
-    // whichever overlay is actually showing reuses each implementation's
-    // own real dismiss path for free, with zero coupling to which one it
-    // is.
+    // Ends whichever Family Hub screensaver is showing (they all close on
+    // pointerdown on their own overlay).
     function wakeAnyScreenSaver() {
       try {
         const overlay = document.querySelector("[data-family-hub-screensaver]");
@@ -149,75 +217,72 @@ if (!window.__familyHubTimerAlarm) {
           overlay.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
         }
       } catch (e) {
-        // Best-effort - worst case the alarm modal still shows ON TOP of a
-        // running screensaver rather than ending it outright.
+        // best-effort
       }
     }
-    function start(timer, hass) {
+    function start(uid, title, body, hass) {
       if (hass) lastHass = hass;
-      if (activeUid === timer.uid) return;
-      activeUid = timer.uid;
+      if (!uid || dismissedUids.has(uid)) return;
+      const isNew = !ringing.has(uid);
+      ringing.set(uid, { title: title || (ringing.get(uid) || {}).title || "Timer", body: body || (ringing.get(uid) || {}).body || "" });
+      if (!isNew) return;
       wakeAnyScreenSaver();
-      const el = ensureModal();
-      el.querySelector(".fh-timer-alarm-title").textContent = timer.title || "Timer";
-      el.style.display = "flex";
-      beepOnce();
-      if (beepHandle) clearInterval(beepHandle);
-      // Shorter gap than the old single-tone version (1200ms) since each
-      // cycle is now a ~450ms triplet, not a single ~340ms tone - this
-      // keeps the alarm feeling urgent/continuous rather than sparse.
-      beepHandle = setInterval(beepOnce, 950);
+      render();
+      if (!beepHandle) {
+        beepOnce();
+        beepHandle = setInterval(beepOnce, 950);
+      }
+    }
+    function stop(uid) {
+      if (!uid) return;
+      dismissedUids.add(uid);
+      const had = ringing.delete(uid);
+      if (!ringing.size && beepHandle) {
+        clearInterval(beepHandle);
+        beepHandle = null;
+      }
+      render();
+      if (had && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
+        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
+      }
     }
     return {
-      // Call once a second from a card's own countdown ticker (the same
-      // tick that already repaints the visible "X:XX left" text), passing:
-      //   timers        - that card's own freshly-fetched timers list
-      //   clientId      - this tab's own id (see _familyHubClientId below)
-      //   remainingSecondsFn - a (timer) => seconds function, so this
-      //                   singleton reuses the CALLING card's own
-      //                   native-timer-aware math (_timerRemainingSeconds)
-      //                   instead of a second, potentially-drifting copy
-      //                   of it living here with no access to `hass`.
-      // Only a timer whose origin_client_id matches THIS tab's own id and
-      // whose alarm flag is on can ever trigger anything - a timer someone
-      // else started, or one this same tab started but didn't opt into
-      // alarms for, is silently ignored here exactly as before this
-      // feature existed.
+      // From a card's 1-second countdown tick: the tab that started a timer
+      // rings the moment it reaches zero (any timer it started, alarm-style
+      // or not, assigned or not).
       check(timers, clientId, remainingSecondsFn, hass) {
-        if (!clientId) return;
-        const mine = (timers || []).find((t) => t.alarm && t.origin_client_id && t.origin_client_id === clientId);
-        if (!mine || dismissedUids.has(mine.uid)) return;
-        if (remainingSecondsFn(mine) <= 0) start(mine, hass);
+        if (hass) lastHass = hass;
+        const me = clientId || myClientId();
+        if (!me) return;
+        (timers || []).forEach((t) => {
+          if (t && t.origin_client_id && t.origin_client_id === me && !dismissedUids.has(t.uid) && remainingSecondsFn(t) <= 0) {
+            start(t.uid, t.title || "Timer", "", hass);
+          }
+        });
       },
-      // the WIDENED half - a household_timer_alarm_ring bus
-      // event (fired by chores_websocket_api.py's _dispatch_timer_alarm/
-      // _reannounce_active_alarms) that THIS login should also ring for,
-      // because it's either the timer's own owner, a login flagged as an
-      // always-on alarm kiosk, or the tier was "everyone." Unlike check()
-      // above (which only ever recognizes the ONE tab that started the
-      // timer, by origin_client_id), this recognizes a login/account -
-      // every open tab logged in as a matching user rings, on every
-      // dashboard, which is the whole point of the widened tiers. Re-fired
-      // on every re-announcement (see _reannounce_active_alarms), so
-      // calling this again for an already-ringing uid is a deliberate
-      // no-op (start() already short-circuits on activeUid === timer.uid).
+      // The backend's ring event (and list_active_alarms on load).
       ringBroadcast(payload, hass, myUserId) {
         if (!payload || !payload.uid || dismissedUids.has(payload.uid)) return;
         const targets = payload.target_user_ids || [];
-        const shouldRing = !!payload.broadcast_all || (myUserId && targets.includes(myUserId));
+        const fromHere = !!payload.origin_client_id && payload.origin_client_id === myClientId();
+        const shouldRing = !!payload.broadcast_all || fromHere || (myUserId && targets.includes(myUserId));
         if (!shouldRing) return;
-        start({ uid: payload.uid, title: payload.title }, hass);
+        start(payload.uid, payload.timer_title || payload.title, payload.body, hass);
       },
-      // The STOP half of the same broadcast pair - fired the instant
-      // ANY device dismisses (see ws_dismiss_timer_alarm's own "first tap
-      // wins" docstring), including a dismiss that originated from THIS
-      // singleton's own stop() above (that call's own dismiss already
-      // covers this tab; the event still arrives here a moment later and
-      // is a harmless no-op via stop()'s own activeUid !== uid guard, or
-      // via dismissedUids already containing it).
+      // Someone stopped it somewhere else.
       stopFromServer(uid) {
-        if (uid) dismissedUids.add(uid);
-        if (activeUid === uid) stop();
+        if (!uid) return;
+        dismissedUids.add(uid);
+        if (ringing.delete(uid)) {
+          if (!ringing.size && beepHandle) {
+            clearInterval(beepHandle);
+            beepHandle = null;
+          }
+          render();
+        }
+      },
+      _ringing() {
+        return Array.from(ringing.keys());
       },
     };
   })();
@@ -369,24 +434,44 @@ class FamilyHubPantryCard extends HTMLElement {
     return (lang || "en").split("-")[0].toLowerCase();
   }
   _ensureTranslationsLoaded() {
+    __fhUseHass(this._hass);
     if (!this._hass || typeof this._hass.loadBackendTranslation !== "function") return;
     const lang = this._baseLanguage(this._hass.language);
-    if (this._i18nLoadedLang === lang || this._i18nLoading === lang) return;
+    if (this._i18nLoadedLang === lang) {
+      // v1.168.67 fix (GitHub issue #10 - "German localization on buttons
+      // only after click on settings"): Home Assistant hands cards the hass
+      // object that actually knows the newly loaded strings a moment AFTER
+      // loadBackendTranslation resolves, so the redraw in .then() below
+      // still ran with the old, English-only localize. Redraw once more
+      // whenever a new localize arrives for the already-loaded language.
+      if (this._hass.localize !== this._i18nLocalize) {
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
+      }
+      return;
+    }
+    if (this._i18nLoading === lang) return;
     this._i18nLoading = lang;
     this._hass
       .loadBackendTranslation("fh_ui", "family_hub")
       .then(() => {
         this._i18nLoadedLang = lang;
         this._i18nLoading = null;
-        this._applyTranslations();
-        this._render();
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
       })
       .catch((e) => {
         this._i18nLoading = null;
         console.warn("[family_hub] failed to load \"" + lang + "\" translations - staying on English fallback text", e);
       });
   }
+  // Redraws everything that shows translated text.
+  _onTranslationsReady() {
+    this._applyTranslations();
+    this._render();
+  }
   _applyTranslations() {
+    __fhSweep(this._root || this.shadowRoot);
     if (!this._root) return;
     this._root.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.dataset.i18n;
@@ -434,7 +519,7 @@ class FamilyHubPantryCard extends HTMLElement {
     try {
       const unsubRing = await this._hass.connection.subscribeEvents((event) => {
         if (window.__familyHubTimerAlarm) {
-          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, myUserId);
+          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, typeof this._myUserId === "function" ? this._myUserId() : myUserId);
         }
       }, "family_hub_timer_alarm_ring");
       const unsubStop = await this._hass.connection.subscribeEvents((event) => {
@@ -504,7 +589,7 @@ class FamilyHubPantryCard extends HTMLElement {
     };
   }
   _defaultSettings() {
-    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "liquidglass" };
+    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "slate" };
   }
   _getSettings() {
     return this._settingsCache || this._defaultSettings();
@@ -538,7 +623,7 @@ class FamilyHubPantryCard extends HTMLElement {
     });
     const cardOpacity = typeof g.cardOpacity === "number" ? g.cardOpacity : 100;
     const glassBlur = typeof g.glassBlur === "number" ? g.glassBlur : 0;
-    return { colors, cardOpacity, glassBlur };
+    return { colors, cardOpacity, glassBlur, background: g.background || null };
   }
   _resolveTheme(settings) {
     const local = settings.theme || this._defaultTheme();
@@ -581,6 +666,17 @@ class FamilyHubPantryCard extends HTMLElement {
     if (deviceOverride) return `device:${deviceOverride}`;
     return "household";
   }
+  _fhThemeBgVars(bg) {
+    const img = bg && typeof bg.image === "string" && bg.image ? bg.image : "";
+    if (!img) return { "--fc-bg-image": "none", "--fc-bg-overlay-image": "none", "--fc-bg-size": "cover", "--fc-bg-position": "center" };
+    const ov = this._hexToRgba(/^#[0-9a-fA-F]{6}$/.test(bg.overlayColor || "") ? bg.overlayColor : "#000000", Number(bg.overlayOpacity) || 0);
+    return {
+      "--fc-bg-image": `url("${img.replace(/"/g, '\\"')}")`,
+      "--fc-bg-overlay-image": `linear-gradient(${ov}, ${ov})`,
+      "--fc-bg-size": bg.size === "repeat" ? "auto" : bg.size || "cover",
+      "--fc-bg-position": bg.position || "center",
+    };
+  }
   _applyThemeVars() {
     const theme = this._resolveTheme(this._getSettings());
     // same "liquid glass" support family-week-calendar-card.js has
@@ -609,6 +705,14 @@ class FamilyHubPantryCard extends HTMLElement {
       "--fc-surface2": this._hexToRgba(theme.colors.surface2, cardOpacity / 100),
       "--fc-glass-blur": `${glassBlur}px`,
     };
+        // v1.168.79 - the theme's own background image (the Liquid Glass
+    // aurora, or any image a theme sets in Theme Builder) now paints
+    // behind this card too, not just the calendar/Today cards - without
+    // it a glass theme's translucent surfaces only had a flat color to
+    // show through, so nothing looked like glass. Always set (to "none"
+    // when there's no image) so a cached earlier theme can't leave a
+    // stale image behind.
+    Object.assign(vars, this._fhThemeBgVars(theme.background));
     Object.keys(vars).forEach((name) => this.style.setProperty(name, vars[name]));
     if (window.__familyHubThemeCache) window.__familyHubThemeCache.set(this._familyHubThemeCacheKey(), vars);
   }
@@ -822,7 +926,7 @@ class FamilyHubPantryCard extends HTMLElement {
           Connect Grocy under Family Hub's Settings to track real stock here. Your "Also Tracking" list below still works either way.
         </div>
         <div class="toolbar">
-          <input type="search" class="pantry-search" placeholder="Search pantry...">
+          <input data-fh-placeholder="text.search_pantry" type="search" class="pantry-search" placeholder="${__fhT("text.search_pantry", "Search pantry...", null, "h")}">
           <select class="pantry-sort" title="Sort Grocy Stock by" data-i18n-title="pantry.sort_title">
             <option value="name" data-i18n="pantry.sort_name">Sort: Name</option>
             <option value="location" data-i18n="pantry.sort_location">Sort: Location</option>
@@ -912,7 +1016,7 @@ class FamilyHubPantryCard extends HTMLElement {
       </label>
       <label class="new-product-toggle"><input type="checkbox" class="f-new-product"> ${this._t("pantry.not_in_grocy_toggle", "This isn't in Grocy yet - add it as a new product")}</label>
       <div class="new-product-fields" hidden>
-        <label>${this._t("pantry.new_product_name_label", "New product name")}<input type="text" class="f-new-name" placeholder="e.g. Canned tomatoes"></label>
+        <label>${this._t("pantry.new_product_name_label", "New product name")}<input data-fh-placeholder="text.e_g_canned_tomatoes" type="text" class="f-new-name" placeholder="${__fhT("text.e_g_canned_tomatoes", "e.g. Canned tomatoes", null, "h")}"></label>
         <label>${this._t("pantry.stock_unit_label", "Stock unit")}<select class="f-new-unit">${unitOptions}</select></label>
       </div>
       <label>${this._t("pantry.amount_label", "Amount")}<input type="number" class="f-amount" min="0" step="any" value="1"></label>
@@ -1129,9 +1233,9 @@ class FamilyHubPantryCard extends HTMLElement {
       <h3>${this._t("pantry.edit_product_title", "Edit product")}</h3>
       <label>${this._t("pantry.name_label", "Name")}<input type="text" class="f-name" value="${this._escAttr(product.name)}"></label>
       <label>${this._t("pantry.category_label", "Category")}<select class="f-category">${categoryOptions}</select></label>
-      <input type="text" class="f-new-category-name" hidden placeholder="New category name">
+      <input data-fh-placeholder="text.new_category_name" type="text" class="f-new-category-name" hidden placeholder="${__fhT("text.new_category_name", "New category name", null, "h")}">
       <label>${this._t("pantry.location_label", "Location")}<select class="f-location">${locationOptions}</select></label>
-      <input type="text" class="f-new-location-name" hidden placeholder="New location name">
+      <input data-fh-placeholder="text.new_location_name" type="text" class="f-new-location-name" hidden placeholder="${__fhT("text.new_location_name", "New location name", null, "h")}">
       <label>${this._t("pantry.stock_unit_label", "Stock unit")}<select class="f-qu-stock">${unitOptions}</select></label>
       <label>${this._t("pantry.purchase_unit_label", "Purchase unit")}<select class="f-qu-purchase">${unitOptions}</select></label>
       <label>${this._t("pantry.min_stock_amount_label", "Min stock amount")}<input type="number" class="f-min-stock" min="0" step="any" value="${product.min_stock_amount || 0}"></label>
@@ -1253,9 +1357,9 @@ class FamilyHubPantryCard extends HTMLElement {
     const box = overlay.querySelector(".modal-box");
     box.innerHTML = `
       <h3>${extra ? this._t("pantry.edit_item_title", "Edit item") : this._t("pantry.track_something_else", "Track something else")}</h3>
-      <label>${this._t("pantry.name_label", "Name")}<input type="text" class="f-name" value="${extra ? this._escAttr(extra.name) : ""}" placeholder="e.g. Paper towels (garage backup)"></label>
-      <label>${this._t("pantry.quantity_label", "Quantity")}<input type="text" class="f-quantity" value="${extra ? this._escAttr(extra.quantity || "") : ""}" placeholder="e.g. 2 rolls"></label>
-      <label>${this._t("pantry.location_label", "Location")}<input type="text" class="f-location" value="${extra ? this._escAttr(extra.location || "") : ""}" placeholder="e.g. Garage shelf"></label>
+      <label>${this._t("pantry.name_label", "Name")}<input data-fh-placeholder="text.e_g_paper_towels_garage_backup" type="text" class="f-name" value="${extra ? this._escAttr(extra.name) : ""}" placeholder="${__fhT("text.e_g_paper_towels_garage_backup", "e.g. Paper towels (garage backup)", null, "h")}"></label>
+      <label>${this._t("pantry.quantity_label", "Quantity")}<input data-fh-placeholder="text.e_g_2_rolls" type="text" class="f-quantity" value="${extra ? this._escAttr(extra.quantity || "") : ""}" placeholder="${__fhT("text.e_g_2_rolls", "e.g. 2 rolls", null, "h")}"></label>
+      <label>${this._t("pantry.location_label", "Location")}<input data-fh-placeholder="text.e_g_garage_shelf" type="text" class="f-location" value="${extra ? this._escAttr(extra.location || "") : ""}" placeholder="${__fhT("text.e_g_garage_shelf", "e.g. Garage shelf", null, "h")}"></label>
       <label>${this._t("pantry.expiration_date_label", "Expiration date (optional)")}<input type="date" class="f-expiration" value="${extra && extra.expiration_date ? extra.expiration_date : ""}"></label>
       <label>${this._t("pantry.notes_label", "Notes")}<textarea class="f-notes" rows="2">${extra ? this._esc(extra.notes || "") : ""}</textarea></label>
       <div class="modal-actions">
@@ -1431,7 +1535,7 @@ class FamilyHubPantryCard extends HTMLElement {
          as another full board alongside them rather than a small stacked
          card - see family-hub-chores-card.js's own ha-card/.header/.board
          rules, which these are copied from. */
-      ha-card { background: var(--fc-bg); color: var(--fc-text); padding: 12px; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+      ha-card { background: var(--fc-bg); background-image: var(--fc-bg-overlay-image, none), var(--fc-bg-image, none); background-size: cover, var(--fc-bg-size, cover); background-position: center, var(--fc-bg-position, center); color: var(--fc-text); padding: 12px; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
       .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; }
       .title { font-size: 18px; font-weight: 800; }
       .actions { display: flex; align-items: center; gap: 8px; }

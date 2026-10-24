@@ -20,7 +20,9 @@ THEME_STORAGE_VERSION = 1
 # headroom for - without this bump, a fresh install would seed all 8
 # slots with presets and the Theme Builder "Add theme" button would be
 # permanently disabled from the very first load.
-MAX_THEMES = 10
+# v1.168.76: + HA Light / HA Dark = 10 built-ins, so 12 keeps the same 2
+# custom-theme slots.
+MAX_THEMES = 12
 
 REMINDERS_STORAGE_KEY_PREFIX = "family_hub_reminders_notified"
 REMINDERS_STORAGE_VERSION = 1
@@ -183,19 +185,22 @@ SETTINGS_BACKUP_FILENAME = "settings_backup.json"
 # This instead keeps SETTINGS_HISTORY_MAX_SNAPSHOTS distinct, timestamped
 # generations inside Home Assistant's own Store (not a bare file - this is
 # meant to be browsed and picked from an admin UI, not just read back blind
-# on an empty store), captured together as one snapshot ON THE HOUR, every
-# hour (__init__.py's async_setup_entry registers this with
-# async_track_time_change(hass, _snapshot_settings_history, minute=0,
-# second=0) - deliberately wall-clock-aligned rather than a plain interval
-# timer, so it always fires at :00 and never silently drifts to a
-# different minute depending on when the entry last started or reloaded) -
-# the Settings Store, the Permissions Store, AND the Device Settings Store
-# all at once, since an admin restoring "what things looked like at 3pm"
-# wants all three back in sync with each other, not just the Settings
-# blob. See __init__.py's _maybe_snapshot_settings_history (the automatic
-# on-the-hour capture, which skips a tick entirely when nothing in any of
-# the three stores changed since the last snapshot - a quiet household
-# shouldn't burn all 3 generations on identical copies of the same data),
+# on an empty store), captured together as one snapshot every 12 hours -
+# household ask, verbatim, later extended: "extend number of backups to 8,
+# taken every 12 hours" (__init__.py's async_setup_entry registers this
+# with async_track_time_change(hass, _snapshot_settings_history,
+# hour=[0, 12], minute=0, second=0) - deliberately wall-clock-aligned
+# rather than a plain interval timer, so it always fires at 00:00/12:00
+# and never silently drifts to a different time depending on when the
+# entry last started or reloaded) - the Settings Store, the Permissions
+# Store, AND the Device Settings Store all at once, since an admin
+# restoring "what things looked like at noon" wants all three back in
+# sync with each other, not just the Settings blob. See __init__.py's
+# _maybe_snapshot_settings_history (the automatic 12-hourly capture, which
+# skips a tick entirely when nothing in any of the three stores changed
+# since the last snapshot - a quiet household shouldn't burn all
+# SETTINGS_HISTORY_MAX_SNAPSHOTS generations on identical copies of the
+# same data),
 # _manual_backup_settings_history (the Settings panel's "Back up now"
 # button - same capture, but always saves even when unchanged, since
 # pressing that button is itself a request for a guaranteed restore point
@@ -208,7 +213,7 @@ SETTINGS_BACKUP_FILENAME = "settings_backup.json"
 # shape.
 SETTINGS_HISTORY_STORAGE_KEY_PREFIX = "family_hub_settings_history"
 SETTINGS_HISTORY_STORAGE_VERSION = 1
-SETTINGS_HISTORY_MAX_SNAPSHOTS = 3
+SETTINGS_HISTORY_MAX_SNAPSHOTS = 8
 
 # Same durable-backup mechanism as SETTINGS_BACKUP_FILENAME above, extended
 # (1.78.2) to the three Chores/Rewards/Permissions stores - those are ALSO
@@ -589,7 +594,10 @@ EVENT_FAMILY_HUB_TIMER_FINISHED = "family_hub_timer_finished"
 # (a restart mid-countdown on a helper with restore off), and a countdown
 # that silently never ends is a far worse failure than one that ends a few
 # seconds late.
-TIMER_SWEEP_SECONDS = 30
+# v1.168.74: every timer is also scheduled to fire on the exact second (see
+# chores_websocket_api._schedule_timer); this sweep is the backstop and the
+# re-announce tick for ringing alarms.
+TIMER_SWEEP_SECONDS = 15
 
 # Guard rails on a timer's length. 1 minute minimum (anything shorter is a
 # mis-typed entry, not a real intent); 24 hours maximum (a "timer" longer
@@ -763,6 +771,28 @@ EVENT_FAMILY_HUB_TIMER_ALARM_STOP = "family_hub_timer_alarm_stop"
 # _reannounce_active_alarms in chores_websocket_api.py.
 ALARM_REANNOUNCE_SECONDS = 45
 
+# v1.168.74 (timer + alarm overhaul): a ringing alarm stops by itself after
+# this long if nobody taps Stop anywhere - logged as "auto-stopped" - so an
+# empty house isn't announcing on its speakers forever. Household's choice.
+ALARM_AUTO_STOP_SECONDS = 30 * 60
+# Every Family Hub timer alarm push carries a Stop button with this action
+# id + the timer uid; tapping it on the phone stops the alarm everywhere
+# (see chores_websocket_api.handle_mobile_notification_action).
+ALARM_STOP_ACTION_PREFIX = "FAMILY_HUB_STOP_ALARM_"
+# The timer log (who set what, when it ended, how, where it rang, who
+# stopped it) keeps this many most-recent timers.
+TIMER_LOG_MAX_ENTRIES = 300
+# Automation hooks alongside EVENT_FAMILY_HUB_TIMER_FINISHED. Every one
+# carries the same fields (uid, kind, title, user_id/user_name, chore_id,
+# reward_item_id, started_by, source, started_at, duration_minutes,
+# ends_at, native_timer_entity_id) plus "reason" on the end events.
+EVENT_FAMILY_HUB_TIMER_STARTED = "family_hub_timer_started"
+EVENT_FAMILY_HUB_TIMER_CANCELLED = "family_hub_timer_cancelled"
+EVENT_FAMILY_HUB_TIMER_ALARM_STOPPED = "family_hub_timer_alarm_stopped"
+SERVICE_START_TIMER = "start_timer"
+SERVICE_CANCEL_TIMER = "cancel_timer"
+SERVICE_STOP_TIMER_ALARM = "stop_timer_alarm"
+
 # First-time setup wizard (config_flow.py's async_step_calendars/grocy/
 # todo_lists/finish): everything it collects - which calendars to monitor,
 # Grocy's URL/API key, and which to-do list backs Meal Plan/Reminders - was
@@ -815,6 +845,12 @@ CONF_INITIAL_USER_PROFILES = "initial_user_profiles"
 CONF_INITIAL_ROUTINES_ENABLED = "initial_routines_enabled"
 CONF_INITIAL_GOALS_IN_CHORES = "initial_goals_in_chores"
 CONF_INITIAL_GOALS_IN_REWARDS = "initial_goals_in_rewards"
+# v1.168.60: calendars picked on the wizard's Calendars step that aren't
+# any member's own calendar (a shared Family calendar, a child without a
+# login, ...) - seeded once as Settings > Calendars rows by
+# _maybe_seed_calendar_rows_from_setup_wizard. Members' own calendars come
+# in through CONF_INITIAL_USER_PROFILES' primaryCalendar instead.
+CONF_INITIAL_CALENDARS = "initial_calendars"
 
 # Same wizard, two more steps: async_step_notifications asks for a default
 # notify target for calendar event reminders plus which device(s) should
@@ -922,6 +958,15 @@ THEME_SELECTOR_CARD_JS_URL = "/family_hub_theme_selector/theme-selector-card.js"
 # outside of dashboard edit mode, served and auto-registered the same way
 # as the Today card above.
 SCREENSAVER_CARD_JS_URL = "/family_hub_screensaver_card/family-screensaver-card.js"
+
+# A small standalone companion card - "what's going on for everyone right
+# now": each person's current event (with a progress bar, or Free) plus
+# what's next and an optional Home/Away presence pill. Same four-step
+# registration pattern as the Today/Screensaver cards above (static path,
+# content-hash cache-busting, then _register_dashboard_resource) - no new
+# websocket commands, it reads the exact same shared Settings to-do item
+# every other card already does.
+RIGHT_NOW_CARD_JS_URL = "/family_hub_right_now_card/family-right-now-card.js"
 
 ICON_URL = "/family_hub_static/icon.png"
 
@@ -1250,6 +1295,23 @@ REMINDER_SUBSCRIPTION_LEVELS = (REMINDER_SUBSCRIPTION_CALENDAR, REMINDER_SUBSCRI
 #     virtual column for it, named after this profile's own household
 #     member name, so "include a user's calendar under their name on the
 #     calendar" works without ever touching the general Calendars list.
+#   - extraCalendars (list of str, default []): household ask, verbatim,
+#     "you should add the person's additional calendar under their
+#     user" - read-only overlay calendars whose events get merged into
+#     THIS profile's own primaryCalendar column on the dashboard (never
+#     editable/deletable from there - only primaryCalendar itself ever
+#     is). Only takes effect once primaryCalendar above is set - there's
+#     no column for these to attach to otherwise. Used to live on the
+#     matching settings.people[i].extraEntities row instead (the "Also
+#     show events from" field under the general Calendars tab); that
+#     field is gone from the card's UI as of this version, and
+#     _migrate_people_extra_calendars_into_profiles (__init__.py, run on
+#     every Settings load AND save, same convention as the reminders
+#     migration above) moves any already-saved data forward the same
+#     way. A people[] row whose calendar isn't anybody's primaryCalendar
+#     keeps reading its own extraEntities directly (nowhere to move it
+#     to) - see family-week-calendar-card.js's
+#     _primaryCalendarExtraEntitiesByEntity/_getPeople for the merge.
 SETTINGS_KEY_USER_PROFILES = "userProfiles"
 # Marker (also stored in the Settings blob, alongside userProfiles) so the
 # one-time migration never re-runs and clobbers hand-edited profiles with a
@@ -1553,7 +1615,10 @@ DEVICE_SETTINGS_FIELDS = {
         "label": "Rows shown in Week view", "scope": "instance",
     },
     "familyCalendarWeekViewVariantLocal": {
-        "type": "enum", "choices": ["week", "planner"], "default": "week",
+        # v1.168.83: "agenda" added - the card has offered Agenda here
+        # since v1.168.77, but this list didn't, so a device set to Agenda
+        # had its whole device-settings report/push rejected.
+        "type": "enum", "choices": ["week", "planner", "agenda"], "default": "week",
         "label": "Week button shows", "scope": "instance",
     },
     "familyCalendarMonthViewVariantLocal": {
@@ -1783,6 +1848,19 @@ CHORE_KEY_QUANTITY_REMAINING = "quantity_remaining"
 # on the frontend (family-hub-chores-card.js's _sortChoresForColumn), the
 # backend just stores and passes it through.
 CHORE_KEY_IMPORTANT = "important"
+
+# Household ask, verbatim: "Chores should have a button to Mark in
+# progress also." A lightweight, reversible marker - NOT a fourth state-
+# machine status alongside open/pending_verification/approved (see
+# chore_engine.py's own module docstring for that diagram) - so a
+# household member can signal "I'm working on this" without touching the
+# open -> pending_verification -> approved flow at all. Only meaningful
+# while a chore is CHORE_STATUS_OPEN; set_chore_in_progress enforces that,
+# and complete_chore/reject_chore/reset_recurring_chore/assign_chore all
+# clear it back to False the moment a chore leaves (or re-enters) "open"
+# under a new occurrence or a new assignee - see each of their own
+# comments. Defaults to False on every chore (see default_chore).
+CHORE_KEY_IN_PROGRESS = "in_progress"
 
 # Implemented as fan-out: one
 # ordinary single-assignee chore is created PER assignee (reusing the
@@ -2126,6 +2204,17 @@ CHORE_PERMISSIONS = (
 # _ws_get_calendar_delete_support (__init__.py) checks - not vendored here
 # since real Home Assistant isn't a dependency of this repo, so the bit
 # value is inlined rather than imported.
+# A calendar entity implementing `async_create_event` reports this bit -
+# checked by _ws_get_calendar_delete_support the same way DELETE_EVENT/
+# UPDATE_EVENT are below, so the Add Event modal's own Repeat accordion
+# (family-week-calendar-card.js) knows whether to offer repeating events
+# at all for the currently-selected calendar - recurrence (the `rrule`
+# field) only ever reaches a calendar through CalendarEntity.async_
+# create_event itself (see _build_entity_event_fields in __init__.py),
+# never through the public create_event SERVICE, so "this calendar can
+# create events at all" and "this calendar can create a REPEATING
+# event" happen to be the exact same question for recurrence purposes.
+CALENDAR_ENTITY_FEATURE_CREATE_EVENT = 1
 CALENDAR_ENTITY_FEATURE_DELETE_EVENT = 2
 # A calendar entity implementing `async_update_event` (HA core's own
 # calendar/__init__.py) reports this bit instead/as well - checked by

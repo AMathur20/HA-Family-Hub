@@ -106,6 +106,74 @@
 // screensaver idle-timer and "+ picker mode" used only from the day/menu
 // editor's "Pick a Recipe"/"+ From Recipe Box" buttons (_selectLovedDish,
 // _addAdditionalRecipeFromLoved) - calendar-only call sites.
+// ---- Family Hub shared translation helper (v1.168.76) -------------------
+// __fhT(key, english, vars, mode) looks a string up in Home Assistant's
+// loaded "fh_ui" translations (translations/<language>.json → fh_ui.text.*)
+// and falls back to the English text written right here in the source.
+// vars fill %0%, %1%, ... placeholders. mode "h" escapes the translated
+// text (not the vars, which callers already prepared) for use inside HTML
+// markup or an attribute value. Identical copy in every Family Hub card and
+// in the Theme Builder panel - whichever loads first sets it up.
+// __fhSweep(root) re-translates markup that was drawn before the language
+// file finished loading (elements tagged data-fh-t / data-fh-title /
+// data-fh-placeholder / data-fh-aria / data-fh-alt), but only while they
+// still show the English original, so text a card later replaced with
+// something else is never overwritten.
+var __fhI18n = (window.__familyHubI18n = window.__familyHubI18n || { hass: null, fb: {}, loading: null, loaded: null });
+var __fhEsc = function (s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+};
+var __fhT = function (key, fb, vars, mode) {
+  var g = window.__familyHubI18n || __fhI18n;
+  if (g.fb[key] === undefined) g.fb[key] = fb;
+  var str = "";
+  try {
+    if (g.hass && typeof g.hass.localize === "function") str = g.hass.localize("component.family_hub.fh_ui." + key) || "";
+  } catch (e) {
+    str = "";
+  }
+  if (!str) str = fb;
+  if (mode === "h") str = __fhEsc(str);
+  if (vars) {
+    Object.keys(vars).forEach(function (k) {
+      var v = vars[k];
+      str = str.split("%" + k + "%").join(v === null || v === undefined ? "" : String(v));
+    });
+  }
+  return str;
+};
+var __fhUseHass = function (hass) {
+  if (hass && typeof hass.localize === "function") (window.__familyHubI18n || __fhI18n).hass = hass;
+};
+var __fhSweep = function (root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  var g = window.__familyHubI18n || __fhI18n;
+  root.querySelectorAll("[data-fh-t]").forEach(function (el) {
+    var key = el.getAttribute("data-fh-t");
+    var fb = g.fb[key];
+    if (fb === undefined) return;
+    var cur = (el.textContent || "").trim();
+    if (cur !== fb && cur !== el.__fhShown) return;
+    var next = __fhT(key, fb);
+    if (cur !== next) el.textContent = next;
+    el.__fhShown = next;
+  });
+  [["data-fh-title", "title"], ["data-fh-placeholder", "placeholder"], ["data-fh-aria", "aria-label"], ["data-fh-alt", "alt"]].forEach(function (pair) {
+    root.querySelectorAll("[" + pair[0] + "]").forEach(function (el) {
+      var key = el.getAttribute(pair[0]);
+      var fb = g.fb[key];
+      if (fb === undefined) return;
+      var cur = el.getAttribute(pair[1]);
+      var shownKey = "__fhShown_" + pair[1];
+      if (cur !== fb && cur !== el[shownKey]) return;
+      var next = __fhT(key, fb);
+      if (cur !== next) el.setAttribute(pair[1], next);
+      el[shownKey] = next;
+    });
+  });
+};
+// -------------------------------------------------------------------------
+
 if (!window.__familyHubRecipeBoxShared) {
 window.__familyHubRecipeBoxShared = {
 _genId() {
@@ -343,7 +411,7 @@ this._myPermissions = (result && result.permissions) || {};
 this._myPermissions = {};
 }
 },
-async _upsertDish(name, description, link, rating, uidOverride, grocyRecipeId, category, image, checkDuplicates) {
+async _upsertDish(name, description, link, rating, uidOverride, grocyRecipeId, category, image, checkDuplicates, steps) {
 if (!name) return;
 const existing = uidOverride
 ? this._recipes.find((r) => r.uid === uidOverride)
@@ -372,6 +440,13 @@ return;
 // explicitly to actually clear one.
 const finalCategory = category !== undefined ? category : (existing ? existing.category || "" : "");
 const finalImage = image !== undefined ? image : (existing ? existing.image || "" : "");
+// v1.154.0+: steps is a local (non-Grocy) recipe's own ordered step-
+// block array (see _fhOpenStepEditor) - same "undefined means leave it
+// alone" convention as category/image above, since most _upsertDish
+// callers (a heart click, the day/menu editor's "also save this" path)
+// have no idea whether this recipe even has steps and shouldn't blank
+// them out just by never mentioning them.
+const finalSteps = steps !== undefined ? steps : (existing ? existing.steps || [] : []);
 const record = {
 uid: existing ? existing.uid : this._genId(),
 name,
@@ -381,6 +456,7 @@ rating: rating || null,
 grocyRecipeId: grocyRecipeId || null,
 category: finalCategory,
 image: finalImage,
+steps: finalSteps,
 };
 if (existing) {
 this._recipes[this._recipes.indexOf(existing)] = record;
@@ -805,7 +881,7 @@ this._renderLoved();
 _openDishDetail(recipe) {
 const root = this._root;
 this._dishDetailRecipe = recipe;
-root.querySelector(".dish-detail-title").textContent = recipe.name || this._t("recipe_box.untitled", "(untitled)");
+root.querySelector(".dish-detail-title").textContent = recipe.name || "(untitled)";
 const photo = root.querySelector(".dish-detail-photo");
 if (photo) {
 if (recipe.image) {
@@ -818,26 +894,39 @@ photo.style.display = "none";
 }
 const ratingHtml =
 (recipe.rating === "up"
-? `<span class="event-info-chip" style="background:#f2ddd4">&#10084;&#65039; ${this._t("recipe_box.loved_label_text", "Loved")}</span>`
+? `<span data-fh-t="text.loved" class="event-info-chip" style="background:#f2ddd4">${__fhT("text.loved", "❤️ Loved", null, "h")}</span>`
 : recipe.rating === "down"
-? `<span class="event-info-chip" style="background:#d8e3e0">&#128078; ${this._t("recipe_box.not_a_fan_label_text", "Not a fan")}</span>`
+? `<span data-fh-t="text.not_a_fan" class="event-info-chip" style="background:#d8e3e0">${__fhT("text.not_a_fan", "👎 Not a fan", null, "h")}</span>`
 : "") + (recipe.category ? `<span class="event-info-chip">${recipe.category}</span>` : "");
 root.querySelector(".dish-detail-rating").innerHTML = ratingHtml;
-root.querySelector(".dish-detail-desc").textContent = recipe.description || this._t("recipe_box.no_notes_added", "No notes added.");
+root.querySelector(".dish-detail-desc").textContent = recipe.description || __fhT("text.no_notes_added", "No notes added.");
+const stepsEl = root.querySelector(".dish-detail-steps");
+if (stepsEl) {
+this._dishDetailCheckedSteps = new Set();
+stepsEl.innerHTML = this._fhRenderStepBlocksHtml(recipe.steps || [], this._dishDetailCheckedSteps);
+stepsEl.querySelectorAll(".grocy-recipe-instruction-row").forEach((row) => {
+row.querySelector(".grocy-recipe-instruction-check").addEventListener("change", () => {
+const idx = Number(row.dataset.idx);
+if (row.querySelector(".grocy-recipe-instruction-check").checked) this._dishDetailCheckedSteps.add(idx);
+else this._dishDetailCheckedSteps.delete(idx);
+row.classList.toggle("checked-off", row.querySelector(".grocy-recipe-instruction-check").checked);
+});
+});
+}
 const suggestBtn = root.querySelector(".dish-detail-suggest-btn");
 if (suggestBtn) {
-suggestBtn.textContent = this._t("recipe_box.suggest_this", "\u{1F4A1} Suggest this");
+suggestBtn.textContent = __fhT("text.suggest_this", "💡 Suggest this");
 suggestBtn.onclick = () => {
 this._suggestDish(recipe);
-suggestBtn.textContent = this._t("recipe_box.added_to_suggestions", "\u{2705} Added to Suggestions");
+suggestBtn.textContent = __fhT("text.added_to_suggestions", "✅ Added to Suggestions");
 setTimeout(() => {
-suggestBtn.textContent = this._t("recipe_box.suggest_this", "\u{1F4A1} Suggest this");
+suggestBtn.textContent = __fhT("text.suggest_this", "💡 Suggest this");
 }, 1600);
 };
 }
 const linkRow = root.querySelector(".dish-detail-link-row");
 if (recipe.link) {
-const label = recipe.grocyRecipeId ? this._t("recipe_box.view_recipe_link", "&#128279; View recipe") : this._t("recipe_box.open_recipe_link", "&#128279; Open recipe link");
+const label = recipe.grocyRecipeId ? __fhT("text.n128279_view_recipe", "&#128279; View recipe") : __fhT("text.n128279_open_recipe_link", "&#128279; Open recipe link");
 linkRow.innerHTML = `<button type="button" class="pick-loved-btn dish-detail-open-link">${label}</button>`;
 linkRow.querySelector(".dish-detail-open-link").addEventListener("click", () => {
 if (recipe.grocyRecipeId) {
@@ -874,13 +963,297 @@ new Set((this._recipes || []).map((r) => (r.category || "").trim()).filter(Boole
 ).sort((a, b) => a.localeCompare(b));
 datalist.innerHTML = categories.map((c) => `<option value="${c.replace(/"/g, "&quot;")}"></option>`).join("");
 },
-// the full in-card Grocy Recipe Viewer, moved here from being
+// v1.154.0+: new recipe step-block editor (household request: "add an
+// editor that allows you to add pictures at any step and edited recipe.
+// Allow you to add dividers, headers between step and more"). Steps are
+// now an ordered array of typed blocks - {type:"step",text}, {type:
+// "header",text}, {type:"divider"}, {type:"image",url} - rather than
+// plain strings, so instructions can be broken up with section headers,
+// visual dividers, and inline photos at any point. For a Grocy-linked
+// recipe these blocks are serialized into the same "<p><strong>
+// Preparation</strong></p>..." HTML block _renderGrocyRecipeDescription
+// already parses (see _fhParsePreparationBlocks/_fhBlocksToPreparationHtml)
+// so nothing about Grocy's own recipe storage needs to change - headers
+// become <h4>, dividers become <hr>, photos become a lone <img> inside
+// a <p>. For a local (non-Grocy) Recipe Box entry the blocks are instead
+// stored directly as a new "steps" field on the recipe record itself (see
+// _upsertDish) since that storage is schema-less already.
+_fhEscapeHtml(s) {
+return String(s == null ? "" : s)
+.replace(/&/g, "&amp;")
+.replace(/</g, "&lt;")
+.replace(/>/g, "&gt;");
+},
+_fhParsePreparationBlocks(inner) {
+const blocks = [];
+const re = /<h4>([\s\S]*?)<\/h4>|<hr\s*\/?>|<p>([\s\S]*?)<\/p>/gi;
+let m;
+while ((m = re.exec(inner || ""))) {
+if (m[1] !== undefined) {
+const text = m[1].trim();
+if (text) blocks.push({ type: "header", text });
+} else if (/^<hr/i.test(m[0])) {
+blocks.push({ type: "divider" });
+} else if (m[2] !== undefined) {
+const content = m[2].trim();
+const imgMatch = content.match(/^<img[^>]*\bsrc=["']([^"']+)["'][^>]*>$/i);
+if (imgMatch) {
+blocks.push({ type: "image", url: imgMatch[1] });
+} else if (content) {
+blocks.push({ type: "step", text: content });
+}
+}
+}
+return blocks;
+},
+_fhBlocksToPreparationHtml(blocks) {
+return (blocks || [])
+.map((b) => {
+if (b.type === "header") return `<h4>${b.text || ""}</h4>`;
+if (b.type === "divider") return "<hr>";
+if (b.type === "image") return `<p><img src="${(b.url || "").replace(/"/g, "&quot;")}"></p>`;
+return `<p>${b.text || ""}</p>`;
+})
+.join("");
+},
+_fhRenderStepBlocksHtml(blocks, checkedSteps) {
+if (!blocks || !blocks.length) return "";
+checkedSteps = checkedSteps || new Set();
+let stepNum = 0;
+const rows = blocks.map((b, idx) => {
+if (b.type === "header") {
+return `<div class="grocy-recipe-step-header">${b.text || ""}</div>`;
+}
+if (b.type === "divider") {
+return `<hr class="grocy-recipe-step-divider" />`;
+}
+if (b.type === "image") {
+return `<div class="grocy-recipe-step-image-wrap"><img class="grocy-recipe-step-image" src="${b.url || ""}" /></div>`;
+}
+stepNum++;
+const checked = checkedSteps.has(idx) ? " checked-off" : "";
+return `<label class="grocy-recipe-instruction-row${checked}" data-idx="${idx}"><input type="checkbox" class="grocy-recipe-instruction-check"${checked ? " checked" : ""} /><span class="grocy-recipe-instruction-badge">${stepNum}</span><span class="grocy-recipe-instruction-text">${b.text || ""}</span></label>`;
+});
+return `<div data-fh-t="text.instructions" class="grocy-recipe-instructions-title">${__fhT("text.instructions", "Instructions", null, "h")}</div>` + rows.join("");
+},
+async _fhBlobToUploadFromFile(file) {
+let blob = file;
+let name = (file && file.name) || "photo.jpg";
+try {
+const rawDataUrl = await new Promise((resolve, reject) => {
+const reader = new FileReader();
+reader.onload = () => resolve(reader.result);
+reader.onerror = () => reject(reader.error || new Error("Couldn't read that file."));
+reader.readAsDataURL(file);
+});
+const img = await new Promise((resolve, reject) => {
+const el = new Image();
+el.onload = () => resolve(el);
+el.onerror = () => reject(new Error("Couldn't decode that image."));
+el.src = rawDataUrl;
+setTimeout(() => reject(new Error("timed out decoding image")), 1500);
+});
+const maxDim = 1600;
+const width = img.width || maxDim;
+const height = img.height || maxDim;
+const scale = Math.min(1, maxDim / Math.max(width, height));
+const canvas = document.createElement("canvas");
+canvas.width = Math.max(1, Math.round(width * scale));
+canvas.height = Math.max(1, Math.round(height * scale));
+const ctx = canvas.getContext && canvas.getContext("2d");
+if (ctx) {
+ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+const reEncoded = await new Promise((resolve) => {
+if (typeof canvas.toBlob === "function") {
+canvas.toBlob((b) => resolve(b), "image/jpeg", 0.85);
+} else {
+resolve(null);
+}
+});
+if (reEncoded) {
+blob = reEncoded;
+name = "photo.jpg";
+}
+}
+} catch (e) {
+// Best-effort only - falls through to uploading the original file.
+}
+return { blob, name };
+},
+async _fhFetchWithAuth(path, opts) {
+if (this._hass && typeof this._hass.fetchWithAuth === "function") {
+return this._hass.fetchWithAuth(path, opts);
+}
+const token = this._hass && this._hass.auth && this._hass.auth.data && this._hass.auth.data.access_token;
+const headers = Object.assign({}, opts && opts.headers, token ? { authorization: `Bearer ${token}` } : {});
+return fetch(path, Object.assign({}, opts, { headers }));
+},
+async _fhUploadImage(file) {
+if (!file) return null;
+const { blob, name } = await this._fhBlobToUploadFromFile(file);
+const formData = new FormData();
+formData.append("file", blob, name);
+const response = await this._fhFetchWithAuth("/api/image/upload", { method: "POST", body: formData });
+if (!response || !response.ok) {
+throw new Error(`image upload failed (${response && response.status})`);
+}
+const result = await response.json();
+if (!result || !result.id) throw new Error("image upload response had no id");
+return `/api/image/serve/${result.id}/original`;
+},
+_fhOpenStepEditor(blocks, onSave, onCancel) {
+const root = this._root;
+if (!root) return;
+this._fhStepEditorBlocks = (blocks || []).map((b) => Object.assign({}, b));
+this._fhStepEditorOnSave = onSave;
+this._fhStepEditorOnCancel = onCancel;
+this._renderFhStepEditorList();
+this._openModal(this._fhStepEditorOverlay());
+},
+_closeFhStepEditor() {
+const root = this._root;
+if (!root) return;
+this._closeModal(this._fhStepEditorOverlay());
+},
+_fhMoveStepBlock(idx, dir) {
+const blocks = this._fhStepEditorBlocks;
+if (!blocks) return;
+const newIdx = idx + dir;
+if (newIdx < 0 || newIdx >= blocks.length) return;
+const [item] = blocks.splice(idx, 1);
+blocks.splice(newIdx, 0, item);
+this._renderFhStepEditorList();
+},
+_renderFhStepEditorList() {
+const root = this._root;
+if (!root) return;
+const listEl = this._fhStepEditorOverlay().querySelector(".fh-step-editor-list");
+if (!listEl) return;
+const blocks = this._fhStepEditorBlocks || [];
+if (!blocks.length) {
+listEl.innerHTML = `<div data-fh-t="text.no_steps_yet_use_the_buttons_below_to" class="loved-empty">${__fhT("text.no_steps_yet_use_the_buttons_below_to", "No steps yet - use the buttons below to add some.", null, "h")}</div>`;
+return;
+}
+const dragHandle = `<span data-fh-title="text.drag_to_reorder" class="fh-step-editor-drag-handle" title="${__fhT("text.drag_to_reorder", "Drag to reorder", null, "h")}">&#9776;</span>`;
+listEl.innerHTML = blocks
+.map((b, idx) => {
+const controls =
+`<div class="fh-step-editor-row-controls">` +
+`<button type="button" class="fh-step-editor-up-btn" data-idx="${idx}"${idx === 0 ? " disabled" : ""}>&#8593;</button>` +
+`<button type="button" class="fh-step-editor-down-btn" data-idx="${idx}"${idx === blocks.length - 1 ? " disabled" : ""}>&#8595;</button>` +
+`<button type="button" class="fh-step-editor-del-btn" data-idx="${idx}">&#128465;&#65039;</button>` +
+`</div>`;
+if (b.type === "header") {
+return (
+`<div class="fh-step-editor-row fh-step-editor-header-row" data-idx="${idx}">` +
+dragHandle +
+`<input data-fh-placeholder="text.section_header" type="text" class="fh-step-editor-header-input" data-idx="${idx}" value="${this._fhEscapeHtml(b.text || "")}" placeholder="${__fhT("text.section_header", "Section header", null, "h")}" />` +
+controls +
+`</div>`
+);
+}
+if (b.type === "divider") {
+return `<div class="fh-step-editor-row fh-step-editor-divider-row" data-idx="${idx}">${dragHandle}<span class="fh-step-editor-divider-label">&mdash; divider &mdash;</span>${controls}</div>`;
+}
+if (b.type === "image") {
+return `<div class="fh-step-editor-row fh-step-editor-image-row" data-idx="${idx}">${dragHandle}<img class="fh-step-editor-image-preview" src="${b.url || ""}" />${controls}</div>`;
+}
+return (
+`<div class="fh-step-editor-row fh-step-editor-step-row" data-idx="${idx}">` +
+dragHandle +
+`<span class="fh-step-editor-step-num">${idx + 1}</span>` +
+`<textarea data-fh-placeholder="text.step_text" class="fh-step-editor-text-input" data-idx="${idx}" placeholder="${__fhT("text.step_text", "Step text", null, "h")}">${b.text || ""}</textarea>` +
+controls +
+`</div>`
+);
+})
+.join("");
+this._fhStepEditorAttachDrag(listEl);
+listEl.querySelectorAll(".fh-step-editor-text-input, .fh-step-editor-header-input").forEach((el) => {
+el.addEventListener("input", () => {
+const idx = Number(el.dataset.idx);
+if (this._fhStepEditorBlocks[idx]) this._fhStepEditorBlocks[idx].text = el.value;
+});
+});
+listEl.querySelectorAll(".fh-step-editor-up-btn").forEach((btn) => {
+btn.addEventListener("click", () => this._fhMoveStepBlock(Number(btn.dataset.idx), -1));
+});
+listEl.querySelectorAll(".fh-step-editor-down-btn").forEach((btn) => {
+btn.addEventListener("click", () => this._fhMoveStepBlock(Number(btn.dataset.idx), 1));
+});
+listEl.querySelectorAll(".fh-step-editor-del-btn").forEach((btn) => {
+btn.addEventListener("click", () => {
+const idx = Number(btn.dataset.idx);
+this._fhStepEditorBlocks.splice(idx, 1);
+this._renderFhStepEditorList();
+});
+});
+},
+// v1.159.0+: household request, verbatim - "you should be able to drag
+// headings, steps, photos dividers etc around". The up/down buttons
+// stay (still the only option for someone who can't do a drag gesture,
+// e.g. a screen reader or a stylus-only kiosk), this just adds a touch/
+// pointer-driven drag as the faster path for reordering a long list by
+// hand. Pointer Events (not HTML5 drag-and-drop, which mobile Safari/
+// Chrome support inconsistently for touch) dragged via the little grip
+// handle on each row, moving the actual DOM node live as the finger/
+// pointer crosses a neighboring row's midpoint, then resyncing
+// this._fhStepEditorBlocks from the final DOM order once the drag ends
+// - cheap, and avoids re-binding every row's listeners mid-drag the way
+// re-rendering on every pointermove would.
+_fhStepEditorAttachDrag(listEl) {
+const blocks = this._fhStepEditorBlocks || [];
+const rows = Array.from(listEl.querySelectorAll(".fh-step-editor-row"));
+rows.forEach((row, i) => {
+row.__fhBlock = blocks[i];
+const handle = row.querySelector(".fh-step-editor-drag-handle");
+if (!handle) return;
+handle.addEventListener("pointerdown", (e) => {
+e.preventDefault();
+const draggedRow = row;
+draggedRow.classList.add("fh-step-editor-dragging");
+let captured = false;
+try {
+handle.setPointerCapture(e.pointerId);
+captured = true;
+} catch (err) {}
+const onMove = (ev) => {
+const target = document.elementFromPoint(ev.clientX, ev.clientY);
+const overRow = target && target.closest && target.closest(".fh-step-editor-row");
+if (!overRow || overRow === draggedRow || overRow.parentElement !== listEl) return;
+const rect = overRow.getBoundingClientRect();
+const before = ev.clientY < rect.top + rect.height / 2;
+listEl.insertBefore(draggedRow, before ? overRow : overRow.nextSibling);
+};
+const onUp = (ev) => {
+draggedRow.classList.remove("fh-step-editor-dragging");
+handle.removeEventListener("pointermove", onMove);
+handle.removeEventListener("pointerup", onUp);
+handle.removeEventListener("pointercancel", onUp);
+if (captured) {
+try {
+handle.releasePointerCapture(ev.pointerId);
+} catch (err) {}
+}
+this._fhStepEditorBlocks = Array.from(listEl.querySelectorAll(".fh-step-editor-row")).map((r) => r.__fhBlock);
+this._renderFhStepEditorList();
+};
+handle.addEventListener("pointermove", onMove);
+handle.addEventListener("pointerup", onUp);
+handle.addEventListener("pointercancel", onUp);
+});
+});
+},
+// v1.118.0+: the full in-card Grocy Recipe Viewer, moved here from being
 // a FamilyWeekCalendarCard-only set of methods so this card can open the
 // exact same live viewer for a Grocy-linked dish instead of just opening
-// the plain external Grocy link (). Not shared: _selectGrocyRecipe/
+// the plain external Grocy link (household report: "the recipe box card
+// tries to send you to the external grocy link for recipes. this needs
+// to use the internal recipe viewer"). Not shared: _selectGrocyRecipe/
 // _renderGrocyPicker (the "Add from Grocy" search picker) - this card has
 // no such picker and doesn't need one, same as before.
-// Root
+// v1.121.0+: household report, verbatim: "recipe card opens recipes in a
+// modal instead of the full screen like the recipe modal does." Root
 // cause: wherever this shared viewer is running, if the card sits in a
 // normal masonry/sections dashboard grid (rather than filling the whole
 // screen, which is how a panel-view deployment usually hides this
@@ -950,7 +1323,7 @@ this._grocyRecipeViewerPortalEl = portal;
 if (this._grocyRecipeViewerPortalEl && typeof getComputedStyle === "function") {
 const live = getComputedStyle(this);
 [
-"--fc-bg", "--fc-card", "--fc-border", "--fc-text", "--fc-text-secondary",
+"--fc-bg", "--fc-card", "--fc-card-menu", "--fc-border", "--fc-text", "--fc-text-secondary",
 "--fc-accent", "--fc-accent-text", "--fc-accent2", "--fc-accent3",
 "--fc-surface-alt", "--fc-surface2", "--fc-glass-blur", "--fh-header-offset",
 ].forEach((name) => {
@@ -960,11 +1333,45 @@ if (value && value.trim()) this._grocyRecipeViewerPortalEl.style.setProperty(nam
 }
 return overlay;
 },
+_fhStepEditorOverlay() {
+if (!this._fhStepEditorOverlayEl) {
+const root = this._root;
+this._fhStepEditorOverlayEl = root && root.querySelector(".fh-step-editor-overlay");
+}
+const overlay = this._fhStepEditorOverlayEl;
+if (overlay && !this._fhStepEditorPortalEl) {
+const portal = document.createElement("div");
+portal.className = "fh-step-editor-portal";
+// See the matching comment in family-week-calendar-card.js - same
+// portal mechanism as _grocyViewerOverlay, now needed here too since
+// this overlay is a true full-screen modal.
+if (typeof this._css === "function") {
+const style = document.createElement("style");
+style.textContent = this._css().split(":host").join(".fh-step-editor-portal");
+portal.appendChild(style);
+}
+portal.appendChild(overlay);
+document.body.appendChild(portal);
+this._fhStepEditorPortalEl = portal;
+}
+if (this._fhStepEditorPortalEl && typeof getComputedStyle === "function") {
+const live = getComputedStyle(this);
+[
+"--fc-bg", "--fc-card", "--fc-card-menu", "--fc-border", "--fc-text", "--fc-text-secondary",
+"--fc-accent", "--fc-accent-text", "--fc-accent2", "--fc-accent3",
+"--fc-surface-alt", "--fc-surface2", "--fc-glass-blur", "--fh-header-offset",
+].forEach((name) => {
+const value = live.getPropertyValue(name);
+if (value && value.trim()) this._fhStepEditorPortalEl.style.setProperty(name, value.trim());
+});
+}
+return overlay;
+},
 _openGrocyRecipeViewer(recipeId, fallbackName, fallbackLink, isPreview, tabs, sourceRecipe) {
 if (!recipeId) return;
 this._grocyRecipeViewerRecipeId = recipeId;
 this._grocyRecipeViewerFallbackLink = fallbackLink || "";
-// the actual Recipe Box entry this viewer was opened FROM, if
+// v1.129.0+: the actual Recipe Box entry this viewer was opened FROM, if
 // any - only ever passed by the Recipe Box's own primary browse click
 // (see that click handler's own comment, just below in this file), never
 // by a meal-preview/Expiring-Soon/additional-recipe call site elsewhere,
@@ -973,7 +1380,7 @@ this._grocyRecipeViewerFallbackLink = fallbackLink || "";
 // see the .grocy-recipe-viewer-recipe-actions toggle a few lines down.
 this._grocyRecipeViewerSourceRecipe = sourceRecipe || null;
 const overlay = this._grocyViewerOverlay();
-// Preview mode ('s picker preview icon) opens the exact same
+// Preview mode (task #177's picker preview icon) opens the exact same
 // viewer, but over a picker that's deliberately left open underneath -
 // show a "Back" button instead of relying on the plain close (X) to
 // implicitly reveal it, so it reads as "look, then come back" rather
@@ -984,10 +1391,10 @@ overlay.classList.toggle("preview-mode", !!isPreview);
 // the inline style here would silently leave it hidden even in preview
 // mode instead of showing it.
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-back-btn").style.display = isPreview ? "block" : "none";
-// same "block", not "" gotcha as the back button above -
+// v1.129.0+: same "block", not "" gotcha as the back button above -
 // .grocy-recipe-viewer-recipe-actions defaults to display:none in CSS.
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-recipe-actions").style.display = this._grocyRecipeViewerSourceRecipe ? "flex" : "none";
-this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title").textContent = fallbackName || this._t("recipe_box.recipe_fallback", "Recipe");
+this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title").textContent = fallbackName || __fhT("text.recipe", "Recipe");
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-stats").innerHTML = "";
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-servings").textContent = "";
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-ingredients").innerHTML = "";
@@ -1033,7 +1440,7 @@ if (this._grocyRecipeViewerTabs) {
 tabsEl.innerHTML = this._grocyRecipeViewerTabs
 .map(
 (t) =>
-`<button type="button" class="grocy-recipe-viewer-tab-btn ${String(t.id) === String(recipeId) ? "active" : ""}" data-recipe-tab-id="${t.id}">${t.name || this._t("recipe_box.recipe_fallback", "Recipe")}</button>`
+`<button type="button" class="grocy-recipe-viewer-tab-btn ${String(t.id) === String(recipeId) ? "active" : ""}" data-recipe-tab-id="${t.id}">${t.name || __fhT("text.recipe", "Recipe", null, "h")}</button>`
 )
 .join("");
 tabsEl.style.display = "flex";
@@ -1053,7 +1460,7 @@ this._resetScreenSaverIdleTimer();
 },
 _closeGrocyRecipeViewer() {
 this._grocyViewerOverlay().classList.remove("open");
-// don't let a stale Recipe Box entry leak into the NEXT
+// v1.129.0+: don't let a stale Recipe Box entry leak into the NEXT
 // viewer open (a bare-recipe-id call site, e.g. a meal preview, that
 // forgets to pass a 6th argument would otherwise inherit whatever was
 // last set here rather than correctly showing no Suggest/Edit/Delete
@@ -1071,11 +1478,11 @@ this._resetScreenSaverIdleTimer();
 async _consumeGrocyRecipeIngredients() {
 const recipeId = this._grocyRecipeViewerRecipeId;
 if (!recipeId || !this._hass) return;
-if (!window.confirm(this._t("recipe_box.confirm_consume_ingredients", "Deduct this recipe's ingredients from your Grocy stock now? This can't be undone from here."))) {
+if (!window.confirm(__fhT("text.deduct_this_recipe_s_ingredients_from", "Deduct this recipe's ingredients from your Grocy stock now? This can't be undone from here."))) {
 return;
 }
 const statusEl = this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-status");
-statusEl.textContent = this._t("recipe_box.status_consuming", "Consuming ingredients in Grocy…");
+statusEl.textContent = __fhT("text.consuming_ingredients_in_grocy", "Consuming ingredients in Grocy…");
 statusEl.classList.remove("is-error");
 try {
 // Only sent when the viewer's own scaler has been moved off the
@@ -1093,26 +1500,26 @@ recipe_id: recipeId,
 ...(servings ? { servings } : {}),
 });
 if (result.configured === false) {
-statusEl.textContent = this._t("recipe_box.status_grocy_not_connected", "Grocy isn't connected — set it up under Settings > Devices & Services > Family Hub > Configure > Grocy.");
+statusEl.textContent = __fhT("text.grocy_isn_t_connected_set_it_up_under", "Grocy isn't connected — set it up under Settings > Devices & Services > Family Hub > Configure > Grocy.");
 statusEl.classList.add("is-error");
 return;
 }
 if (!result.success) {
-statusEl.textContent = this._t("recipe_box.status_consume_failed", `Couldn't consume this recipe's ingredients: ${result.error || "unknown error"}`, { error: result.error || this._t("recipe_box.unknown_error", "unknown error") });
+statusEl.textContent = __fhT("text.couldn_t_consume_this_recipe_s", "Couldn't consume this recipe's ingredients: %0%", {0: result.error || "unknown error"});
 statusEl.classList.add("is-error");
 return;
 }
-statusEl.textContent = this._t("recipe_box.status_consumed", "Ingredients deducted from Grocy stock.");
+statusEl.textContent = __fhT("text.ingredients_deducted_from_grocy_stock", "Ingredients deducted from Grocy stock.");
 statusEl.classList.remove("is-error");
 } catch (e) {
-statusEl.textContent = this._t("recipe_box.status_cant_reach_grocy", "Couldn't reach Grocy.");
+statusEl.textContent = __fhT("text.couldn_t_reach_grocy", "Couldn't reach Grocy.");
 statusEl.classList.add("is-error");
 }
 },
 async _fetchGrocyRecipeDetail(recipeId) {
 if (!this._hass) return;
 const statusEl = this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-status");
-statusEl.textContent = this._t("recipe_box.status_loading_recipe", "Loading recipe from Grocy…");
+statusEl.textContent = __fhT("text.loading_recipe_from_grocy", "Loading recipe from Grocy…");
 statusEl.classList.remove("is-error");
 try {
 const result = await this._hass.connection.sendMessagePromise({
@@ -1120,18 +1527,18 @@ type: "family_hub/get_grocy_recipe_detail",
 recipe_id: recipeId,
 });
 if (result.configured === false) {
-statusEl.textContent = this._t("recipe_box.status_grocy_not_connected", "Grocy isn't connected — set it up under Settings > Devices & Services > Family Hub > Configure > Grocy.");
+statusEl.textContent = __fhT("text.grocy_isn_t_connected_set_it_up_under", "Grocy isn't connected — set it up under Settings > Devices & Services > Family Hub > Configure > Grocy.");
 return;
 }
 if (result.error || !result.recipe) {
-statusEl.textContent = this._t("recipe_box.status_load_failed", `Couldn't load this recipe from Grocy: ${result.error || "not found"}`, { error: result.error || this._t("recipe_box.not_found", "not found") });
+statusEl.textContent = __fhT("text.couldn_t_load_this_recipe_from_grocy_x", "Couldn't load this recipe from Grocy: %0%", {0: result.error || "not found"});
 statusEl.classList.add("is-error");
 return;
 }
 statusEl.textContent = "";
 this._renderGrocyRecipeDetail(result.recipe);
 } catch (e) {
-statusEl.textContent = this._t("recipe_box.status_cant_reach_grocy", "Couldn't reach Grocy.");
+statusEl.textContent = __fhT("text.couldn_t_reach_grocy", "Couldn't reach Grocy.");
 statusEl.classList.add("is-error");
 }
 },
@@ -1150,7 +1557,7 @@ statusEl.classList.add("is-error");
 async _fetchGrocyRecipeDetailsBatch(recipeIds, activeId) {
 if (!this._hass) return;
 const statusEl = this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-status");
-statusEl.textContent = this._t("recipe_box.status_loading_recipes", "Loading recipes from Grocy…");
+statusEl.textContent = __fhT("text.loading_recipes_from_grocy", "Loading recipes from Grocy…");
 statusEl.classList.remove("is-error");
 try {
 const result = await this._hass.connection.sendMessagePromise({
@@ -1158,14 +1565,14 @@ type: "family_hub/get_grocy_recipe_details",
 recipe_ids: recipeIds,
 });
 if (result.configured === false) {
-statusEl.textContent = this._t("recipe_box.status_grocy_not_connected", "Grocy isn't connected — set it up under Settings > Devices & Services > Family Hub > Configure > Grocy.");
+statusEl.textContent = __fhT("text.grocy_isn_t_connected_set_it_up_under", "Grocy isn't connected — set it up under Settings > Devices & Services > Family Hub > Configure > Grocy.");
 return;
 }
 this._grocyRecipeViewerDetailsById = result.recipes || {};
 this._grocyRecipeViewerTabErrors = result.errors || {};
 this._renderActiveGrocyRecipeViewerTab(activeId);
 } catch (e) {
-statusEl.textContent = this._t("recipe_box.status_cant_reach_grocy", "Couldn't reach Grocy.");
+statusEl.textContent = __fhT("text.couldn_t_reach_grocy", "Couldn't reach Grocy.");
 statusEl.classList.add("is-error");
 }
 },
@@ -1187,7 +1594,7 @@ return;
 }
 const err = (this._grocyRecipeViewerTabErrors || {})[String(recipeId)];
 const tabInfo = ((this._grocyRecipeViewerTabs || []).find((t) => String(t.id) === String(recipeId)) || {});
-this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title").textContent = tabInfo.name || this._t("recipe_box.recipe_fallback", "Recipe");
+this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title").textContent = tabInfo.name || __fhT("text.recipe", "Recipe");
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-stats").innerHTML = "";
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-servings").textContent = "";
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-ingredients").innerHTML = "";
@@ -1195,7 +1602,7 @@ this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-instructions").in
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-description").innerHTML = "";
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-scale-row").style.display = "none";
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-photo").style.display = "none";
-statusEl.textContent = this._t("recipe_box.status_load_failed", `Couldn't load this recipe from Grocy: ${err || "not found"}`, { error: err || this._t("recipe_box.not_found", "not found") });
+statusEl.textContent = __fhT("text.couldn_t_load_this_recipe_from_grocy_x", "Couldn't load this recipe from Grocy: %0%", {0: err || "not found"});
 statusEl.classList.add("is-error");
 },
 // Tab-row click handler (delegated, see the connectedCallback wiring on
@@ -1226,22 +1633,22 @@ photoEl.style.display = "block";
 photoEl.style.display = "none";
 photoEl.src = "";
 }
-this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title").textContent = recipe.name || this._t("recipe_box.recipe_fallback", "Recipe");
-// Prep/Cook/Total stat pills (/mockup) - only the ones this
+this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title").textContent = recipe.name || __fhT("text.recipe", "Recipe");
+// Prep/Cook/Total stat pills (task #250/mockup) - only the ones this
 // recipe actually has real data for; a manually-typed Grocy recipe with
 // none of the three published just gets an empty (and, per the
 // :empty CSS rule, invisible) stats row instead of a placeholder.
 const statsEl = this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-stats");
 const statDefs = [
-[this._t("recipe_box.stat_prep", "Prep"), recipe.prep_time],
-[this._t("recipe_box.stat_cook", "Cook"), recipe.cook_time],
-[this._t("recipe_box.stat_total", "Total"), recipe.total_time],
+["Prep", recipe.prep_time],
+["Cook", recipe.cook_time],
+["Total", recipe.total_time],
 ].filter(([, value]) => (value || "").trim());
 statsEl.innerHTML = statDefs
 .map(([label, value]) => `<div class="grocy-recipe-stat"><span class="grocy-recipe-stat-label">${label}</span><span class="grocy-recipe-stat-value">${value}</span></div>`)
 .join("");
 this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-servings").textContent = recipe.servings
-? this._t("recipe_box.makes_servings", `Makes ${recipe.servings} serving${recipe.servings === 1 ? "" : "s"}`, { n: String(recipe.servings) })
+? __fhT("text.makes_x_serving_x", "Makes %0% serving%1%", {0: recipe.servings, 1: recipe.servings === 1 ? "" : "s"})
 : "";
 // The picker only ever had the list-page link; once the detail call
 // resolves we have the authoritative one from the recipe object itself
@@ -1250,7 +1657,17 @@ this._grocyRecipeViewerFallbackLink = recipe.link || this._grocyRecipeViewerFall
 
 const ingredients = Array.isArray(recipe.ingredients) ? recipe.ingredients : [];
 this._grocyRecipeViewerIngredients = ingredients;
-// The scaler () works off the recipe's own base_servings - the
+// Checking off an ingredient or a step is scoped to one viewing of one
+// recipe - re-opening the same recipe (or switching tabs to another one,
+// for multi-recipe tabbed viewing) starts every box unchecked again,
+// same as a paper copy would. Reset here (recipe detail load), not in
+// _renderGrocyRecipeIngredients/_renderGrocyRecipeDescription, since
+// those two also re-run on every serving-scale change and must NOT wipe
+// what's already checked off mid-cook just because someone bumped the
+// servings stepper.
+this._grocyRecipeViewerCheckedIngredients = new Set();
+this._grocyRecipeViewerCheckedSteps = new Set();
+// The scaler (task #173) works off the recipe's own base_servings - the
 // serving count Grocy's recipes_pos amounts are actually calibrated for -
 // separate from "servings" above, which can reflect a previously-saved
 // desired_servings override instead. Falls back gracefully to whatever's
@@ -1268,7 +1685,7 @@ this._renderGrocyRecipeIngredients();
 // The description/instructions HTML can itself embed a plain-text
 // ingredients list (see _createImportedGrocyRecipe's "Ingredients"
 // <ul> block, added for recipes imported via the card's "Import a
-// recipe from a link" flow, ) - kept unscaled here so
+// recipe from a link" flow, task #158) - kept unscaled here so
 // _renderGrocyRecipeDescription can re-derive the scaled version from
 // the original every time the stepper changes, rather than scaling an
 // already-scaled string a second time.
@@ -1279,7 +1696,7 @@ this._renderGrocyRecipeDescription();
 // servings ratio - mirrors _renderGrocyRecipeIngredients, but for the
 // plain-text "Ingredients" list some recipes also carry inside their
 // description HTML (see the comment above). Recipes without that exact
-// block (hand-typed directly in Grocy, or from before) simply
+// block (hand-typed directly in Grocy, or from before task #158) simply
 // pass through _scaleIngredientsDescriptionHtml unchanged.
 _renderGrocyRecipeDescription() {
 if (!this._root) return;
@@ -1289,7 +1706,8 @@ if (!descEl) return;
 const raw = this._grocyRecipeViewerRawDescription || "";
 if (!raw) {
 if (instructionsEl) instructionsEl.innerHTML = "";
-descEl.innerHTML = `<div class="loved-empty">${this._t("recipe_box.no_instructions", "No instructions added in Grocy.")}</div>`;
+descEl.innerHTML = `<div data-fh-t="text.no_instructions_added_in_grocy" class="loved-empty">${__fhT("text.no_instructions_added_in_grocy", "No instructions added in Grocy.", null, "h")}</div>`;
+this._grocyRecipeViewerStepBlocks = [];
 return;
 }
 const baseServings = this._grocyRecipeViewerBaseServings || 1;
@@ -1298,35 +1716,35 @@ const ratio = baseServings > 0 ? servings / baseServings : 1;
 let html = this._scaleIngredientsDescriptionHtml(raw, ratio);
 
 // Recipes imported via this card's own "Import a recipe from a link"
-// flow (_createImportedGrocyRecipe, /#223) write a predictable
+// flow (_createImportedGrocyRecipe, task #158/#223) write a predictable
 // "<p><strong>Preparation</strong></p><p>step 1</p><p>step 2</p>..."
 // block, followed by (optionally) the Prep/Cook line and/or a Source
 // line, each of which starts with its own "<p><strong>". Recipes without
 // that exact shape (hand-typed directly in Grocy, older imports, plain
-// pasted text with no parsed steps) simply have no match here and fall
-// through to the untouched raw-HTML rendering exactly as before this
-// feature existed - nothing about them changes.
+// pasted text with no parsed steps) simply have no match here, and the
+// "Edit Steps" button starts them off with a blank steps list rather
+// than nothing to edit at all.
+//
+// v1.154.0+: this block is now parsed into typed step blocks (plain
+// steps, section headers, dividers, inline photos - see
+// _fhParsePreparationBlocks) instead of just a flat array of step
+// strings, so the household's step editor can add/reorder headers,
+// dividers, and photos anywhere in the instructions.
 const stepsMatch = html.match(/<p><strong>Preparation<\/strong><\/p>([\s\S]*?)(?=<p><strong>|$)/i);
-const steps = [];
-if (stepsMatch) {
-const stepRe = /<p>([\s\S]*?)<\/p>/gi;
-let m;
-while ((m = stepRe.exec(stepsMatch[1]))) {
-const text = m[1].trim();
-if (text) steps.push(text);
-}
-}
+const blocks = stepsMatch ? this._fhParsePreparationBlocks(stepsMatch[1]) : [];
+this._grocyRecipeViewerStepBlocks = blocks;
 
 if (instructionsEl) {
-instructionsEl.innerHTML = steps.length
-? `<div class="grocy-recipe-instructions-title">${this._t("recipe_box.instructions_title", "Instructions")}</div>` +
-steps
-.map(
-(step, i) =>
-`<div class="grocy-recipe-instruction-row"><span class="grocy-recipe-instruction-badge">${i + 1}</span><span class="grocy-recipe-instruction-text">${step}</span></div>`
-)
-.join("")
-: "";
+instructionsEl.innerHTML = this._fhRenderStepBlocksHtml(blocks, this._grocyRecipeViewerCheckedSteps);
+instructionsEl.querySelectorAll(".grocy-recipe-instruction-row").forEach((row) => {
+row.querySelector(".grocy-recipe-instruction-check").addEventListener("change", () => {
+const idx = Number(row.dataset.idx);
+if (!this._grocyRecipeViewerCheckedSteps) this._grocyRecipeViewerCheckedSteps = new Set();
+if (row.querySelector(".grocy-recipe-instruction-check").checked) this._grocyRecipeViewerCheckedSteps.add(idx);
+else this._grocyRecipeViewerCheckedSteps.delete(idx);
+row.classList.toggle("checked-off", row.querySelector(".grocy-recipe-instruction-check").checked);
+});
+});
 }
 
 // Once a block has its own dedicated element above (structured
@@ -1337,7 +1755,8 @@ steps
 // _ws_create_grocy_recipe's "skipped" list), so the structured list
 // above can be a strict SUBSET of what's in the raw text - and outright
 // removing the raw block used to hide those skipped ingredients
-// entirely (a real ). Rather than try to judge redundancy and
+// entirely (a real household report: "not including the ingredients in
+// the preparation section"). Rather than try to judge redundancy and
 // hide it, this always keeps the raw written-out list available - just
 // tucked behind a collapsed-by-default accordion, so it's a tap away
 // when needed (a skipped ingredient, double-checking exact wording,
@@ -1348,14 +1767,14 @@ if (ingredientsBlockMatch) {
 const accordionHtml =
 `<div class="grocy-recipe-ingredients-accordion">` +
 `<button type="button" class="accordion-toggle recipe-viewer-ingredients-toggle" data-target="recipe-viewer-ingredients-body">` +
-`<span class="theme-section-label">${this._t("recipe_box.written_out_ingredients", "Written-out ingredients list")}</span>` +
+`<span data-fh-t="text.written_out_ingredients_list" class="theme-section-label">${__fhT("text.written_out_ingredients_list", "Written-out ingredients list", null, "h")}</span>` +
 `<span class="accordion-chevron">&#9660;</span>` +
 `</button>` +
 `<div class="accordion-body" id="recipe-viewer-ingredients-body"><ul>${ingredientsBlockMatch[1]}</ul></div>` +
 `</div>`;
 html = html.replace(ingredientsBlockMatch[0], accordionHtml);
 }
-if (steps.length) {
+if (stepsMatch) {
 html = html.replace(stepsMatch[0], "");
 }
 // The Prep/Cook line is now always shown as its own stat pills whenever
@@ -1363,7 +1782,7 @@ html = html.replace(stepsMatch[0], "");
 // redundant here - safe to strip unconditionally.
 html = html.replace(/<p>[\s\S]*?<strong>(?:Prep|Cook):<\/strong>[\s\S]*?<\/p>/i, "");
 html = html.trim();
-descEl.innerHTML = html || `<div class="loved-empty">${this._t("recipe_box.no_additional_notes", "No additional notes.")}</div>`;
+descEl.innerHTML = html || `<div data-fh-t="text.no_additional_notes" class="loved-empty">${__fhT("text.no_additional_notes", "No additional notes.", null, "h")}</div>`;
 const ingredientsToggle = descEl.querySelector(".recipe-viewer-ingredients-toggle");
 if (ingredientsToggle) {
 ingredientsToggle.addEventListener("click", () => {
@@ -1372,6 +1791,88 @@ ingredientsToggle.classList.toggle("open");
 if (body) body.classList.toggle("open");
 });
 }
+},
+// Save step for the "Edit Steps" button (see _fhOpenStepEditor) - a
+// Grocy-linked recipe's instructions live entirely inside its own
+// description field as a "<p><strong>Preparation</strong></p>..." block
+// (see _renderGrocyRecipeDescription/_fhParsePreparationBlocks), so
+// saving new step blocks means re-fetching the recipe's CURRENT raw
+// description fresh from Grocy, splicing the newly-serialized Preparation
+// block back into it in place (leaving the Ingredients/Prep-Cook/Source
+// lines this editor never touches exactly as they were), and sending the
+// whole thing back through family_hub/update_grocy_recipe - which,
+// being a full delete-then-recreate of recipes_pos rows, also needs this
+// recipe's ingredients echoed back unchanged (same pattern as
+// _saveGrocyRecipeIngredientEdits where that method exists).
+async _saveGrocyRecipeStepEdits(recipeId, blocks, reopenName, reopenLink, reopenSourceRecipe) {
+if (!this._hass || !recipeId) return;
+// v1.154.0+: the "Edit Steps" button closes the (possibly document.body
+// -portal'd) Grocy Recipe Viewer before opening this plain shadow-root
+// step editor overlay on top of it (see that button's own click
+// handler) - so unlike _saveGrocyRecipeIngredientEdits, there's no
+// still-open viewer with its own status line to write progress/errors
+// into here. Every exit path below instead reopens the viewer fresh
+// (showing the saved result, or the unchanged recipe plus an alert() on
+// failure) rather than leaving the household on a bare closed modal.
+const reopenViewer = () => {
+this._openGrocyRecipeViewer(recipeId, reopenName, reopenLink, false, null, reopenSourceRecipe);
+};
+let detailResult;
+try {
+detailResult = await this._hass.connection.sendMessagePromise({ type: "family_hub/get_grocy_recipe_detail", recipe_id: recipeId });
+} catch (e) {
+window.alert(__fhT("text.couldn_t_reach_the_backend_steps_weren", "Couldn't reach the backend - steps weren't saved."));
+reopenViewer();
+return;
+}
+if (detailResult.configured === false || !detailResult.recipe) {
+window.alert(detailResult.error || __fhT("text.couldn_t_load_this_recipe_from_grocy", "Couldn't load this recipe from Grocy - steps weren't saved."));
+reopenViewer();
+return;
+}
+const detail = detailResult.recipe;
+const rawDescription = detail.description || "";
+const ingredients = (detail.ingredients || []).map((ing) => {
+const amountText = ing.variable_amount || (typeof ing.amount_value === "number" ? String(ing.amount_value) : "");
+const raw = (ing.note && ing.note.trim()) || `${amountText} ${ing.product || ""}`.trim() || ing.product || "";
+return {
+raw,
+amount_text: amountText,
+amount: typeof ing.amount_value === "number" && isFinite(ing.amount_value) ? ing.amount_value : null,
+not_check_stock_fulfillment: !!ing.not_check_stock_fulfillment,
+product_id: ing.product_id || null,
+unit_id: ing.qu_id || null,
+};
+});
+const stepsMatch = rawDescription.match(/<p><strong>Preparation<\/strong><\/p>([\s\S]*?)(?=<p><strong>|$)/i);
+const newPrepHtml = blocks.length ? `<p><strong data-fh-t="text.preparation">${__fhT("text.preparation", "Preparation", null, "h")}</strong></p>${this._fhBlocksToPreparationHtml(blocks)}` : "";
+let newDescription;
+if (stepsMatch) {
+newDescription = rawDescription.slice(0, stepsMatch.index) + newPrepHtml + rawDescription.slice(stepsMatch.index + stepsMatch[0].length);
+} else {
+newDescription = rawDescription + newPrepHtml;
+}
+let result;
+try {
+result = await this._hass.connection.sendMessagePromise({
+type: "family_hub/update_grocy_recipe",
+recipe_id: recipeId,
+name: detail.name || "",
+description: newDescription,
+servings: detail.base_servings || 1,
+ingredients,
+});
+} catch (e) {
+window.alert(__fhT("text.couldn_t_reach_the_backend_steps_weren", "Couldn't reach the backend - steps weren't saved."));
+reopenViewer();
+return;
+}
+if (result.configured === false || !result.success) {
+window.alert((result && result.error) || __fhT("text.couldn_t_save_those_steps", "Couldn't save those steps."));
+reopenViewer();
+return;
+}
+reopenViewer();
 },
 // Finds the "Ingredients" <ul> block _createImportedGrocyRecipe writes
 // into a recipe's description (raw scraped lines like "2 cups flour",
@@ -1404,7 +1905,7 @@ return html.slice(0, match.index) + match[1] + scaledItems + match[3] + html.sli
 // "1 1/2" / "1/2" / "1½" / "½" / "2" / "2.5" / "1-2" -> a plain decimal.
 // A plain range ("1-2", "3-4") resolves to its upper bound rather than
 // failing outright - see the backend's _parse_quantity_token (kept in
-// sync deliberately) for why: the old behavior left ordinary countable
+// sync deliberately) for why: a household reported ordinary countable
 // ingredients like "1-2 russet potatoes" defaulting to "Don't count
 // toward stock" every time, since that checkbox's own default just
 // follows whether a usable number came back at all. Returns null for
@@ -1493,12 +1994,26 @@ if (group) groupHtml = `<div class="grocy-recipe-ingredient-group">${group}</div
 }
 const note = ing.note ? ` <span class="grocy-recipe-ingredient-note">(${ing.note})</span>` : "";
 const amountText = this._formatScaledIngredientAmount(ing, ratio);
-// Numbered circular badge (/mockup) in place of the amount
+// Numbered circular badge (task #251/mockup) in place of the amount
 // leading the row - the amount itself moves down alongside the
-// product name so nothing shown before is lost.
-return `${groupHtml}<div class="grocy-recipe-ingredient-row"><span class="grocy-recipe-ingredient-badge">${idx + 1}</span><span><span class="grocy-recipe-ingredient-amount">${amountText}</span> ${ing.product || ""}${note}</span></div>`;
+// product name so nothing shown before is lost. A checkbox now leads
+// the badge (restyle: "allow checking off ingredients and steps") so
+// a row can be marked done while actually cooking - wrapped in a
+// <label> so tapping anywhere on the row toggles it, not just the
+// small checkbox hit target itself.
+const checked = this._grocyRecipeViewerCheckedIngredients && this._grocyRecipeViewerCheckedIngredients.has(idx) ? " checked-off" : "";
+return `${groupHtml}<label class="grocy-recipe-ingredient-row${checked}" data-idx="${idx}"><input type="checkbox" class="grocy-recipe-ingredient-check"${checked ? " checked" : ""} /><span class="grocy-recipe-ingredient-badge">${idx + 1}</span><span><span class="grocy-recipe-ingredient-amount">${amountText}</span> ${ing.product || ""}${note}</span></label>`;
 })
 .join("");
+ingredientsEl.querySelectorAll(".grocy-recipe-ingredient-row").forEach((row) => {
+row.querySelector(".grocy-recipe-ingredient-check").addEventListener("change", () => {
+const idx = Number(row.dataset.idx);
+if (!this._grocyRecipeViewerCheckedIngredients) this._grocyRecipeViewerCheckedIngredients = new Set();
+if (row.querySelector(".grocy-recipe-ingredient-check").checked) this._grocyRecipeViewerCheckedIngredients.add(idx);
+else this._grocyRecipeViewerCheckedIngredients.delete(idx);
+row.classList.toggle("checked-off", row.querySelector(".grocy-recipe-ingredient-check").checked);
+});
+});
 },
 // A free-text amount ("to taste") can't be scaled - passed through as-is.
 // Anything without a raw numeric amount_value (an older/partial response)
@@ -1532,18 +2047,38 @@ this._renderGrocyRecipeDescription();
 // it silently never rang for anyone else's widened timer alarm. Kept
 // byte-identical to every other card's copy on purpose.
 if (!window.__familyHubTimerAlarm) {
+  // v1.168.74 (timer + alarm overhaul): the on-screen half of a Family Hub
+  // timer alarm - a full-screen "time's up" with a looping alarm sound that
+  // keeps going until someone taps Stop, shared by every Family Hub card on
+  // the page (one modal, one sound, appended to document.body).
+  //
+  // A screen rings when the backend's family_hub_timer_alarm_ring event
+  // says so: it's the screen that started the timer (origin_client_id =
+  // this tab's id), it's logged in as one of target_user_ids (the owner, a
+  // kiosk login on a "kiosks" alarm), or broadcast_all ("everyone"). The
+  // tab that started a timer also rings on its own the instant its local
+  // countdown reaches zero (check()), so there's no wait for the server.
+  // Several alarms at once each get their own row and Stop button. Stop
+  // here stops it everywhere (screens, phones, speakers).
   window.__familyHubTimerAlarm = (function () {
     let modalEl = null;
     let audioCtx = null;
     let beepHandle = null;
-    let activeUid = null;
-    // A timer's uid, once dismissed, stays dismissed - otherwise the very
-    // next poll's countdown tick (still <= 0 for a few more seconds until
-    // the backend's own sweep, up to TIMER_SWEEP_SECONDS later, actually
-    // removes it from family_hub/timers/list) would immediately re-open
-    // the modal a person just tapped Stop on. Unbounded but negligible: a
-    // few bytes per timer this ONE tab ever alarmed for in its lifetime.
+    const ringing = new Map(); // uid -> {title, body}
     const dismissedUids = new Set();
+    let lastHass = null;
+    function myClientId() {
+      try {
+        let id = sessionStorage.getItem("family_hub_client_id");
+        if (!id) {
+          id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          sessionStorage.setItem("family_hub_client_id", id);
+        }
+        return id;
+      } catch (e) {
+        return "";
+      }
+    }
     function ensureModal() {
       if (modalEl) return modalEl;
       modalEl = document.createElement("div");
@@ -1554,28 +2089,57 @@ if (!window.__familyHubTimerAlarm) {
         background: "rgba(20,16,8,0.78)",
       });
       modalEl.innerHTML =
-        '<div style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:38px 30px;max-width:360px;width:88vw;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
-        '<div style="font-size:48px;margin-bottom:12px;">&#9200;</div>' +
-        '<div class="fh-timer-alarm-title" style="font-size:1.3em;font-weight:800;margin-bottom:6px;"></div>' +
-        '<div style="font-size:14px;color:#96877a;margin-bottom:24px;">Time\'s up!</div>' +
-        '<button type="button" class="fh-timer-alarm-stop" style="min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;">Stop</button>' +
+        '<div class="fh-timer-alarm-box" role="alertdialog" aria-live="assertive" style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:30px 26px;max-width:400px;width:88vw;max-height:86vh;overflow:auto;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
+        '<div style="font-size:48px;margin-bottom:6px;">&#9200;</div>' +
+        ('<div data-fh-t="text.time_s_up" class="fh-timer-alarm-head" style="font-size:14px;color:#96877a;margin-bottom:14px;font-weight:700;">' + __fhT("text.time_s_up", "Time's up!", null, "h") + '</div>') +
+        '<div class="fh-timer-alarm-list" style="display:flex;flex-direction:column;gap:12px;"></div>' +
+        ('<button data-fh-t="text.stop_all" type="button" class="fh-timer-alarm-stop-all" style="display:none;margin-top:16px;min-height:46px;width:100%;border:2px solid #8f5a00;border-radius:14px;background:transparent;color:#8f5a00;font-size:16px;font-weight:800;cursor:pointer;">' + __fhT("text.stop_all", "Stop all", null, "h") + '</button>') +
         "</div>";
       document.body.appendChild(modalEl);
-      modalEl.querySelector(".fh-timer-alarm-stop").addEventListener("click", () => stop());
+      modalEl.addEventListener("click", (e) => {
+        const btn = e.target.closest && e.target.closest("button");
+        if (!btn) return;
+        if (btn.classList.contains("fh-timer-alarm-stop-all")) {
+          Array.from(ringing.keys()).forEach((uid) => stop(uid));
+        } else if (btn.dataset.uid) {
+          stop(btn.dataset.uid);
+        }
+      });
       return modalEl;
     }
-    // A plain oscillator beep via the Web Audio API - deliberately not a
-    // bundled sound file: no extra media asset for HACS/manual installs to
-    // ship or for a self-hosted install's network policy to worry about,
-    // and it sounds identical on every install.
-    //
-    // The original v1.119.0+ sound was one
-    // flat square-wave tone repeated once a second - metronomic, which is
-    // exactly what read as a countdown-bomb tick rather than an alarm. This
-    // plays a quick alternating two-pitch TRIPLET (a classic digital-alarm-
-    // clock trill) each cycle instead of a single tone, which is what
-    // actually reads as "alarm" to the ear - the alternating pitch is what
-    // a lone repeated tone can't give you, no matter how loud.
+    function render() {
+      const el = ensureModal();
+      if (!ringing.size) {
+        el.style.display = "none";
+        return;
+      }
+      const list = el.querySelector(".fh-timer-alarm-list");
+      list.innerHTML = "";
+      ringing.forEach((info, uid) => {
+        const row = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "fh-timer-alarm-title";
+        title.style.cssText = "font-size:1.3em;font-weight:800;margin-bottom:4px;overflow-wrap:anywhere;";
+        title.textContent = info.title || __fhT("text.timer", "Timer");
+        row.appendChild(title);
+        if (info.body) {
+          const body = document.createElement("div");
+          body.style.cssText = "font-size:14px;color:#6b5f52;margin-bottom:10px;overflow-wrap:anywhere;";
+          body.textContent = info.body;
+          row.appendChild(body);
+        }
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "fh-timer-alarm-stop";
+        btn.dataset.uid = uid;
+        btn.textContent = __fhT("text.stop", "Stop");
+        btn.style.cssText = "min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;";
+        row.appendChild(btn);
+        list.appendChild(row);
+      });
+      el.querySelector(".fh-timer-alarm-stop-all").style.display = ringing.size > 1 ? "" : "none";
+      el.style.display = "flex";
+    }
     function playBeep(atTime, freq) {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
@@ -1589,10 +2153,7 @@ if (!window.__familyHubTimerAlarm) {
       osc.start(atTime);
       osc.stop(atTime + 0.15);
     }
-    // Scheduled via Web Audio's own clock (osc.start(atTime)) rather than
-    // three back-to-back setTimeout calls, so the triplet's timing stays
-    // tight even if the main JS thread is briefly busy - it's the crisp,
-    // even spacing that makes it read as a trill instead of a stutter.
+    // A two-pitch alarm-clock trill via Web Audio (no sound file to ship).
     function beepOnce() {
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1600,57 +2161,11 @@ if (!window.__familyHubTimerAlarm) {
         const now = audioCtx.currentTime;
         [[0, 1046], [0.15, 1318], [0.3, 1046]].forEach(([offset, freq]) => playBeep(now + offset, freq));
       } catch (e) {
-        // Autoplay blocked, or no Web Audio at all - the modal is still
-        // the primary alarm; sound is a bonus on top of it, not required.
+        // Autoplay blocked or no Web Audio - the modal is still the alarm.
       }
     }
-    // which hass connection to tell "dismiss this everywhere"
-    // when Stop is tapped - set by whichever card most recently called
-    // ring()/check() with one, since this singleton is shared across every
-    // card on the dashboard and any of them may have `hass` by now. Best-
-    // effort only (see stop() below): a same-tab-only local alarm (the
-    // original v1.119.0+ behavior this singleton already had) never had a
-    // server-side record to begin with, so the dismiss call below simply
-    // no-ops for it (ws_dismiss_timer_alarm pops a uid that was never
-    // registered - see its own docstring for why that's silent, not an
-    // error).
-    let lastHass = null;
-    function stop() {
-      if (activeUid) dismissedUids.add(activeUid);
-      const uid = activeUid;
-      activeUid = null;
-      if (beepHandle) {
-        clearInterval(beepHandle);
-        beepHandle = null;
-      }
-      if (modalEl) modalEl.style.display = "none";
-      // household's explicit choice - "first tap wins, from
-      // anyone" - so tapping Stop here also clears the alarm everywhere
-      // else (other kiosks, other people's phones-that-are-dashboards)
-      // rather than just silencing this one tab. No permission gate, by
-      // design.
-      if (uid && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
-        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
-      }
-    }
-    // This modal already outranks the screensaver's own overlay (z-index
-    // 2147483647 vs 2147483000, set in ensureModal() above), so it was
-    // always painting on top of it - but a screensaver left running
-    // underneath still means its video/camera poll keeps going, so it
-    // needs to actually END, not just be covered up.
-    // There are THREE independent screensaver implementations in this
-    // project (the calendar card's own, the shared window.__familyHub
-    // ScreenSaver controller used by Chores/Rewards/My Chores/etc., and the
-    // standalone family-screensaver-card.js) and this singleton has no
-    // reference to whichever one might be running on this particular
-    // dashboard. Rather than importing all three, every one of them marks
-    // its overlay element with the same data-family-hub-screensaver
-    // attribute and already dismisses itself (hides, stops video/camera
-    // polling, navigates to its configured return dashboard) on its own
-    // overlay's "pointerdown" listener - so a synthetic pointerdown on
-    // whichever overlay is actually showing reuses each implementation's
-    // own real dismiss path for free, with zero coupling to which one it
-    // is.
+    // Ends whichever Family Hub screensaver is showing (they all close on
+    // pointerdown on their own overlay).
     function wakeAnyScreenSaver() {
       try {
         const overlay = document.querySelector("[data-family-hub-screensaver]");
@@ -1658,75 +2173,72 @@ if (!window.__familyHubTimerAlarm) {
           overlay.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
         }
       } catch (e) {
-        // Best-effort - worst case the alarm modal still shows ON TOP of a
-        // running screensaver rather than ending it outright.
+        // best-effort
       }
     }
-    function start(timer, hass) {
+    function start(uid, title, body, hass) {
       if (hass) lastHass = hass;
-      if (activeUid === timer.uid) return;
-      activeUid = timer.uid;
+      if (!uid || dismissedUids.has(uid)) return;
+      const isNew = !ringing.has(uid);
+      ringing.set(uid, { title: title || (ringing.get(uid) || {}).title || "Timer", body: body || (ringing.get(uid) || {}).body || "" });
+      if (!isNew) return;
       wakeAnyScreenSaver();
-      const el = ensureModal();
-      el.querySelector(".fh-timer-alarm-title").textContent = timer.title || "Timer";
-      el.style.display = "flex";
-      beepOnce();
-      if (beepHandle) clearInterval(beepHandle);
-      // Shorter gap than the old single-tone version (1200ms) since each
-      // cycle is now a ~450ms triplet, not a single ~340ms tone - this
-      // keeps the alarm feeling urgent/continuous rather than sparse.
-      beepHandle = setInterval(beepOnce, 950);
+      render();
+      if (!beepHandle) {
+        beepOnce();
+        beepHandle = setInterval(beepOnce, 950);
+      }
+    }
+    function stop(uid) {
+      if (!uid) return;
+      dismissedUids.add(uid);
+      const had = ringing.delete(uid);
+      if (!ringing.size && beepHandle) {
+        clearInterval(beepHandle);
+        beepHandle = null;
+      }
+      render();
+      if (had && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
+        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
+      }
     }
     return {
-      // Call once a second from a card's own countdown ticker (the same
-      // tick that already repaints the visible "X:XX left" text), passing:
-      //   timers        - that card's own freshly-fetched timers list
-      //   clientId      - this tab's own id (see _familyHubClientId below)
-      //   remainingSecondsFn - a (timer) => seconds function, so this
-      //                   singleton reuses the CALLING card's own
-      //                   native-timer-aware math (_timerRemainingSeconds)
-      //                   instead of a second, potentially-drifting copy
-      //                   of it living here with no access to `hass`.
-      // Only a timer whose origin_client_id matches THIS tab's own id and
-      // whose alarm flag is on can ever trigger anything - a timer someone
-      // else started, or one this same tab started but didn't opt into
-      // alarms for, is silently ignored here exactly as before this
-      // feature existed.
+      // From a card's 1-second countdown tick: the tab that started a timer
+      // rings the moment it reaches zero (any timer it started, alarm-style
+      // or not, assigned or not).
       check(timers, clientId, remainingSecondsFn, hass) {
-        if (!clientId) return;
-        const mine = (timers || []).find((t) => t.alarm && t.origin_client_id && t.origin_client_id === clientId);
-        if (!mine || dismissedUids.has(mine.uid)) return;
-        if (remainingSecondsFn(mine) <= 0) start(mine, hass);
+        if (hass) lastHass = hass;
+        const me = clientId || myClientId();
+        if (!me) return;
+        (timers || []).forEach((t) => {
+          if (t && t.origin_client_id && t.origin_client_id === me && !dismissedUids.has(t.uid) && remainingSecondsFn(t) <= 0) {
+            start(t.uid, t.title || "Timer", "", hass);
+          }
+        });
       },
-      // the WIDENED half - a household_timer_alarm_ring bus
-      // event (fired by chores_websocket_api.py's _dispatch_timer_alarm/
-      // _reannounce_active_alarms) that THIS login should also ring for,
-      // because it's either the timer's own owner, a login flagged as an
-      // always-on alarm kiosk, or the tier was "everyone." Unlike check()
-      // above (which only ever recognizes the ONE tab that started the
-      // timer, by origin_client_id), this recognizes a login/account -
-      // every open tab logged in as a matching user rings, on every
-      // dashboard, which is the whole point of the widened tiers. Re-fired
-      // on every re-announcement (see _reannounce_active_alarms), so
-      // calling this again for an already-ringing uid is a deliberate
-      // no-op (start() already short-circuits on activeUid === timer.uid).
+      // The backend's ring event (and list_active_alarms on load).
       ringBroadcast(payload, hass, myUserId) {
         if (!payload || !payload.uid || dismissedUids.has(payload.uid)) return;
         const targets = payload.target_user_ids || [];
-        const shouldRing = !!payload.broadcast_all || (myUserId && targets.includes(myUserId));
+        const fromHere = !!payload.origin_client_id && payload.origin_client_id === myClientId();
+        const shouldRing = !!payload.broadcast_all || fromHere || (myUserId && targets.includes(myUserId));
         if (!shouldRing) return;
-        start({ uid: payload.uid, title: payload.title }, hass);
+        start(payload.uid, payload.timer_title || payload.title, payload.body, hass);
       },
-      // The STOP half of the same broadcast pair - fired the instant
-      // ANY device dismisses (see ws_dismiss_timer_alarm's own "first tap
-      // wins" docstring), including a dismiss that originated from THIS
-      // singleton's own stop() above (that call's own dismiss already
-      // covers this tab; the event still arrives here a moment later and
-      // is a harmless no-op via stop()'s own activeUid !== uid guard, or
-      // via dismissedUids already containing it).
+      // Someone stopped it somewhere else.
       stopFromServer(uid) {
-        if (uid) dismissedUids.add(uid);
-        if (activeUid === uid) stop();
+        if (!uid) return;
+        dismissedUids.add(uid);
+        if (ringing.delete(uid)) {
+          if (!ringing.size && beepHandle) {
+            clearInterval(beepHandle);
+            beepHandle = null;
+          }
+          render();
+        }
+      },
+      _ringing() {
+        return Array.from(ringing.keys());
       },
     };
   })();
@@ -1888,24 +2400,44 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     return (lang || "en").split("-")[0].toLowerCase();
   }
   _ensureTranslationsLoaded() {
+    __fhUseHass(this._hass);
     if (!this._hass || typeof this._hass.loadBackendTranslation !== "function") return;
     const lang = this._baseLanguage(this._hass.language);
-    if (this._i18nLoadedLang === lang || this._i18nLoading === lang) return;
+    if (this._i18nLoadedLang === lang) {
+      // v1.168.67 fix (GitHub issue #10 - "German localization on buttons
+      // only after click on settings"): Home Assistant hands cards the hass
+      // object that actually knows the newly loaded strings a moment AFTER
+      // loadBackendTranslation resolves, so the redraw in .then() below
+      // still ran with the old, English-only localize. Redraw once more
+      // whenever a new localize arrives for the already-loaded language.
+      if (this._hass.localize !== this._i18nLocalize) {
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
+      }
+      return;
+    }
+    if (this._i18nLoading === lang) return;
     this._i18nLoading = lang;
     this._hass
       .loadBackendTranslation("fh_ui", "family_hub")
       .then(() => {
         this._i18nLoadedLang = lang;
         this._i18nLoading = null;
-        this._applyTranslations();
-        if (this._root) this._renderLoved();
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
       })
       .catch((e) => {
         this._i18nLoading = null;
         console.warn("[family_hub] failed to load \"" + lang + "\" translations - staying on English fallback text", e);
       });
   }
+  // Redraws everything that shows translated text.
+  _onTranslationsReady() {
+    this._applyTranslations();
+    if (this._root) this._renderLoved();
+  }
   _applyTranslations() {
+    __fhSweep(this._root || this.shadowRoot);
     if (!this._root) return;
     this._root.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.dataset.i18n;
@@ -1954,7 +2486,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     try {
       const unsubRing = await this._hass.connection.subscribeEvents((event) => {
         if (window.__familyHubTimerAlarm) {
-          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, myUserId);
+          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, typeof this._myUserId === "function" ? this._myUserId() : myUserId);
         }
       }, "family_hub_timer_alarm_ring");
       const unsubStop = await this._hass.connection.subscribeEvents((event) => {
@@ -2016,6 +2548,13 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       this._grocyRecipeViewerPortalEl = null;
       this._grocyRecipeViewerOverlayEl = null;
     }
+    // Same teardown, same reason, for the step editor's own portal (see
+    // _fhStepEditorOverlay's own comment).
+    if (this._fhStepEditorPortalEl) {
+      this._fhStepEditorPortalEl.remove();
+      this._fhStepEditorPortalEl = null;
+      this._fhStepEditorOverlayEl = null;
+    }
   }
   getCardSize() {
     return 8;
@@ -2070,6 +2609,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     if (!root) return;
     this._editingDishUid = recipe ? recipe.uid : null;
     this._editingDishGrocyRecipeId = (recipe && recipe.grocyRecipeId) || null;
+this._editingDishSteps = recipe ? recipe.steps || [] : [];
     root.querySelector(".rb-editor-title").textContent = recipe ? this._t("recipe_box.edit_recipe_title", "Edit Recipe") : this._t("recipe_box.add_recipe_title", "Add Recipe");
     root.querySelector(".rb-input-name").value = recipe ? recipe.name || "" : "";
     root.querySelector(".rb-input-description").value = recipe ? recipe.description || "" : "";
@@ -2114,7 +2654,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     if (name) {
       // checkDuplicates=true - this IS the deliberate "add/edit a Recipe Box
       // entry" action, same as the modal's own _saveDishEditor.
-      this._upsertDish(name, description, link, this._currentRbRating, this._editingDishUid, this._editingDishGrocyRecipeId, category, image, true);
+      this._upsertDish(name, description, link, this._currentRbRating, this._editingDishUid, this._editingDishGrocyRecipeId, category, image, true, this._editingDishSteps);
       if (addAsSuggestion) {
         this._addSuggestion(name, description, link, this._editingDishGrocyRecipeId);
       }
@@ -2151,14 +2691,14 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
           <button type="button" class="suggestion-add-btn recipe-box-select-btn">&#9989;<span data-i18n="recipe_box.select_btn_suffix"> Select</span></button>
         </div>
         <div class="recipe-box-select-bar" style="display:none;">
-          <span class="recipe-box-select-count">0 selected</span>
+          <span data-fh-t="text.n0_selected" class="recipe-box-select-count">${__fhT("text.n0_selected", "0 selected", null, "h")}</span>
           <div class="recipe-box-select-actions">
             <button type="button" class="recipe-box-select-cancel" data-i18n="common.cancel">Cancel</button>
             <button type="button" class="recipe-box-select-delete" data-i18n="recipe_box.delete">Delete</button>
           </div>
         </div>
         <div class="recipe-box-search-row">
-          <input type="text" class="loved-search" placeholder="&#128269; Search recipes..." />
+          <input data-fh-placeholder="text.search_recipes" type="text" class="loved-search" placeholder="${__fhT("text.search_recipes", "🔍 Search recipes...", null, "h")}" />
           <div class="recipe-view-toggle">
             <button type="button" class="recipe-view-btn" data-view="grid" title="Grid view" aria-label="Grid view" data-i18n-title="recipe_box.grid_view_title">&#9638;</button>
             <button type="button" class="recipe-view-btn" data-view="list" title="List view" aria-label="List view" data-i18n-title="recipe_box.list_view_title">&#9776;</button>
@@ -2174,23 +2714,24 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       </ha-card>
       <div class="modal-overlay dish-detail-overlay">
         <div class="modal-box dish-detail-box">
-          <button class="modal-close dish-detail-close" aria-label="Close" data-i18n-title="common.close">&#10005;</button>
+          <button data-fh-aria="text.close" class="modal-close dish-detail-close" aria-label="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
           <h2 class="dish-detail-title"></h2>
           <img class="dish-detail-photo" style="display:none;" alt="" />
           <div class="dish-detail-rating"></div>
           <div class="dish-detail-desc"></div>
+          <div class="dish-detail-steps"></div>
           <div class="dish-detail-link-row"></div>
           <div class="modal-actions">
-            <button class="btn-cancel dish-detail-suggest-btn">&#128161; Suggest this</button>
-            <button class="btn-cancel dish-detail-edit-btn">&#9999;&#65039;<span data-i18n="recipe_box.edit_suffix"> Edit</span></button>
-            <button class="btn-clear dish-detail-delete-btn">&#128465;&#65039;<span data-i18n="recipe_box.delete_suffix"> Delete</span></button>
+            <button data-fh-t="text.suggest_this" class="btn-cancel dish-detail-suggest-btn">${__fhT("text.suggest_this", "💡 Suggest this", null, "h")}</button>
+            <button data-fh-t="text.edit_2" class="btn-cancel dish-detail-edit-btn">${__fhT("text.edit_2", "✏️ Edit", null, "h")}</button>
+            <button data-fh-t="text.delete_2" class="btn-clear dish-detail-delete-btn">${__fhT("text.delete_2", "🗑️ Delete", null, "h")}</button>
           </div>
         </div>
       </div>
       <div class="modal-overlay grocy-recipe-viewer-overlay">
         <div class="modal-box loved-box">
-          <button class="modal-close grocy-recipe-viewer-close" aria-label="Close" data-i18n-title="common.close">&#10005;</button>
-          <button type="button" class="grocy-recipe-viewer-back-btn" style="display:none;">&#8592;<span data-i18n="recipe_box.back_suffix"> Back</span></button>
+          <button data-fh-aria="text.close" class="modal-close grocy-recipe-viewer-close" aria-label="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
+          <button data-fh-t="text.back" type="button" class="grocy-recipe-viewer-back-btn" style="display:none;">${__fhT("text.back", "← Back", null, "h")}</button>
           <h2 class="grocy-recipe-viewer-title"></h2>
           <div class="grocy-recipe-viewer-tabs" style="display:none;"></div>
           <div class="grocy-recipe-viewer-status"></div>
@@ -2199,11 +2740,11 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
             <div class="grocy-recipe-viewer-main-col">
               <div class="grocy-recipe-viewer-servings"></div>
               <div class="grocy-recipe-viewer-scale-row" style="display:none;">
-                <span class="grocy-recipe-viewer-scale-label" data-i18n="recipe_box.scale_ingredients_for">Scale ingredients for</span>
-                <button type="button" class="grocy-recipe-viewer-scale-down" aria-label="Fewer servings" data-i18n-title="recipe_box.fewer_servings_title">&#8722;</button>
+                <span data-fh-t="text.scale_ingredients_for" class="grocy-recipe-viewer-scale-label">${__fhT("text.scale_ingredients_for", "Scale ingredients for", null, "h")}</span>
+                <button data-fh-aria="text.fewer_servings" type="button" class="grocy-recipe-viewer-scale-down" aria-label="${__fhT("text.fewer_servings", "Fewer servings", null, "h")}">&#8722;</button>
                 <span class="grocy-recipe-viewer-scale-value"></span>
-                <span class="grocy-recipe-viewer-scale-unit" data-i18n="recipe_box.servings_unit">servings</span>
-                <button type="button" class="grocy-recipe-viewer-scale-up" aria-label="More servings" data-i18n-title="recipe_box.more_servings_title">&#43;</button>
+                <span class="grocy-recipe-viewer-scale-unit">servings</span>
+                <button data-fh-aria="text.more_servings" type="button" class="grocy-recipe-viewer-scale-up" aria-label="${__fhT("text.more_servings", "More servings", null, "h")}">&#43;</button>
               </div>
               <div class="grocy-recipe-viewer-ingredients"></div>
             </div>
@@ -2212,24 +2753,47 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
           <div class="grocy-recipe-viewer-instructions"></div>
           <div class="grocy-recipe-viewer-description"></div>
           <div class="grocy-recipe-viewer-footer">
-            <button type="button" class="suggestion-add-btn grocy-recipe-viewer-consume-btn">&#127860;<span data-i18n="recipe_box.mark_consumed_suffix"> Mark Consumed (deduct from Grocy stock)</span></button>
-            <button type="button" class="suggestion-add-btn grocy-recipe-viewer-open-btn">&#128279;<span data-i18n="recipe_box.open_in_grocy_suffix"> Open in Grocy</span></button>
+            <button data-fh-t="text.mark_consumed_deduct_from_grocy_stock" type="button" class="suggestion-add-btn grocy-recipe-viewer-consume-btn">${__fhT("text.mark_consumed_deduct_from_grocy_stock", "🍴 Mark Consumed (deduct from Grocy stock)", null, "h")}</button>
+            <button data-fh-t="text.open_in_grocy" type="button" class="suggestion-add-btn grocy-recipe-viewer-open-btn">${__fhT("text.open_in_grocy", "🔗 Open in Grocy", null, "h")}</button>
+            <!-- See the matching comment in family-week-calendar-card.js -
+                 moved out of .grocy-recipe-viewer-recipe-actions (source-
+                 recipe-only) since Edit Steps only ever needed the Grocy
+                 recipe id, same as Open in Grocy/Mark Consumed above. -->
+            <button data-fh-t="text.edit_steps" type="button" class="suggestion-add-btn grocy-recipe-viewer-edit-steps-btn">${__fhT("text.edit_steps", "📝 Edit Steps", null, "h")}</button>
             <div class="modal-actions grocy-recipe-viewer-recipe-actions" style="display:none;">
-              <button type="button" class="btn-cancel grocy-recipe-viewer-suggest-btn">&#128161;<span data-i18n="recipe_box.suggest_this_suffix"> Suggest this</span></button>
-              <button type="button" class="btn-cancel grocy-recipe-viewer-edit-btn">&#9999;&#65039;<span data-i18n="recipe_box.edit_suffix"> Edit</span></button>
-              <button type="button" class="btn-clear grocy-recipe-viewer-delete-btn">&#128465;&#65039;<span data-i18n="recipe_box.delete_suffix"> Delete</span></button>
+              <button data-fh-t="text.suggest_this" type="button" class="btn-cancel grocy-recipe-viewer-suggest-btn">${__fhT("text.suggest_this", "💡 Suggest this", null, "h")}</button>
+              <button data-fh-t="text.edit_2" type="button" class="btn-cancel grocy-recipe-viewer-edit-btn">${__fhT("text.edit_2", "✏️ Edit", null, "h")}</button>
+              <button data-fh-t="text.delete_2" type="button" class="btn-clear grocy-recipe-viewer-delete-btn">${__fhT("text.delete_2", "🗑️ Delete", null, "h")}</button>
             </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-overlay fh-step-editor-overlay">
+        <div class="modal-box loved-box fh-step-editor-box">
+          <button data-fh-aria="text.close" class="modal-close fh-step-editor-close" aria-label="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
+          <h2 data-fh-t="text.edit_steps_2" class="fh-step-editor-title">${__fhT("text.edit_steps_2", "Edit Steps", null, "h")}</h2>
+          <div class="fh-step-editor-list"></div>
+          <div class="fh-step-editor-add-row">
+            <button data-fh-t="text.step" type="button" class="pick-loved-btn fh-step-editor-add-step">${__fhT("text.step", "+ Step", null, "h")}</button>
+            <button data-fh-t="text.header" type="button" class="pick-loved-btn fh-step-editor-add-header">${__fhT("text.header", "+ Header", null, "h")}</button>
+            <button data-fh-t="text.divider" type="button" class="pick-loved-btn fh-step-editor-add-divider">${__fhT("text.divider", "+ Divider", null, "h")}</button>
+            <button data-fh-t="text.photo" type="button" class="pick-loved-btn fh-step-editor-add-image">${__fhT("text.photo", "+ Photo", null, "h")}</button>
+            <input type="file" class="fh-step-editor-image-input" accept="image/*" style="display:none;" />
+          </div>
+          <div class="modal-actions">
+            <button data-fh-t="text.cancel" type="button" class="btn-cancel fh-step-editor-cancel-btn">${__fhT("text.cancel", "Cancel", null, "h")}</button>
+            <button data-fh-t="text.save" type="button" class="btn-save fh-step-editor-save-btn">${__fhT("text.save", "Save", null, "h")}</button>
           </div>
         </div>
       </div>
       <div class="modal-overlay rb-editor-overlay">
         <div class="modal-box">
           <button class="modal-close rb-editor-close" aria-label="Close" data-i18n-title="common.close">&#10005;</button>
-          <h2 class="rb-editor-title">Add Recipe</h2>
+          <h2 data-fh-t="text.add_recipe" class="rb-editor-title">${__fhT("text.add_recipe", "Add Recipe", null, "h")}</h2>
           <label><span data-i18n="recipe_box.name_label">Name</span><input type="text" class="rb-input-name" maxlength="120" /></label>
           <label><span data-i18n="recipe_box.notes_label">Notes</span><textarea class="rb-input-description" rows="2" maxlength="500"></textarea></label>
           <label><span data-i18n="recipe_box.link_label">Link</span><input type="url" class="rb-input-link" placeholder="https://..." maxlength="500" /></label>
-          <label><span data-i18n="recipe_box.category_label">Category</span><input type="text" class="input-category" list="dish-category-options" placeholder="e.g. Dinner" maxlength="40" /><datalist id="dish-category-options"></datalist></label>
+          <label><span data-i18n="recipe_box.category_label">Category</span><input data-fh-placeholder="text.e_g_dinner" type="text" class="input-category" list="dish-category-options" placeholder="${__fhT("text.e_g_dinner", "e.g. Dinner", null, "h")}" maxlength="40" /><datalist id="dish-category-options"></datalist></label>
           <label><span data-i18n="recipe_box.photo_url_label">Photo URL</span><input type="url" class="rb-input-image" placeholder="https://..." maxlength="500" /></label>
           <img class="rb-image-preview" style="display:none;" alt="" />
           <div class="rating-row">
@@ -2237,6 +2801,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
             <button type="button" class="rating-btn rb-btn-thumbsdown" title="Not a fan" data-i18n-title="recipe_box.not_a_fan_title">&#128078;</button>
           </div>
           <label class="remind-check-opt"><input type="checkbox" class="rb-input-add-suggestion" />&#128161;<span data-i18n="recipe_box.also_add_suggestion_suffix"> Also add to Meal Suggestions</span></label>
+          <button data-fh-t="text.edit_steps" type="button" class="pick-loved-btn rb-editor-edit-steps-btn">${__fhT("text.edit_steps", "📝 Edit Steps", null, "h")}</button>
           <div class="modal-actions">
             <button class="btn-clear rb-editor-delete-btn" style="display:none;" data-i18n="recipe_box.delete">Delete</button>
             <button class="btn-cancel rb-editor-cancel-btn" data-i18n="common.cancel">Cancel</button>
@@ -2314,6 +2879,78 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       this._closeGrocyRecipeViewer();
       this._openRecipeBoxEditor(recipe);
     });
+    root.querySelector(".grocy-recipe-viewer-edit-steps-btn").addEventListener("click", () => {
+      const recipeId = this._grocyRecipeViewerRecipeId;
+      if (!recipeId) return;
+      // See the matching comment in family-week-calendar-card.js: close
+      // the (possibly document.body-portal'd) viewer first and reopen it
+      // fresh on Save/Cancel, rather than risk this plain shadow-root
+      // overlay opening trapped underneath it on a grid dashboard.
+      const titleEl = this._grocyViewerOverlay().querySelector(".grocy-recipe-viewer-title");
+      const name = (titleEl && titleEl.textContent) || "Recipe";
+      const link = this._grocyRecipeViewerFallbackLink;
+      const sourceRecipe = this._grocyRecipeViewerSourceRecipe;
+      this._closeGrocyRecipeViewer();
+      this._fhOpenStepEditor(
+        this._grocyRecipeViewerStepBlocks || [],
+        (blocks) => {
+          this._saveGrocyRecipeStepEdits(recipeId, blocks, name, link, sourceRecipe);
+        },
+        () => {
+          this._openGrocyRecipeViewer(recipeId, name, link, false, null, sourceRecipe);
+        }
+      );
+    });
+    root.querySelector(".fh-step-editor-add-step").addEventListener("click", () => {
+      this._fhStepEditorBlocks.push({ type: "step", text: "" });
+      this._renderFhStepEditorList();
+    });
+    root.querySelector(".fh-step-editor-add-header").addEventListener("click", () => {
+      this._fhStepEditorBlocks.push({ type: "header", text: "" });
+      this._renderFhStepEditorList();
+    });
+    root.querySelector(".fh-step-editor-add-divider").addEventListener("click", () => {
+      this._fhStepEditorBlocks.push({ type: "divider" });
+      this._renderFhStepEditorList();
+    });
+    root.querySelector(".fh-step-editor-add-image").addEventListener("click", () => {
+      this._fhStepEditorOverlay().querySelector(".fh-step-editor-image-input").click();
+    });
+    root.querySelector(".fh-step-editor-image-input").addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = "";
+      if (!file) return;
+      const addImageBtn = this._fhStepEditorOverlay().querySelector(".fh-step-editor-add-image");
+      const prevLabel = addImageBtn.textContent;
+      addImageBtn.textContent = __fhT("text.uploading", "Uploading…");
+      addImageBtn.disabled = true;
+      try {
+        const url = await this._fhUploadImage(file);
+        this._fhStepEditorBlocks.push({ type: "image", url });
+        this._renderFhStepEditorList();
+      } catch (err) {
+        window.alert(__fhT("text.couldn_t_upload_that_photo_x", "Couldn't upload that photo: %0%", {0: err && err.message ? err.message : err}));
+      } finally {
+        addImageBtn.textContent = prevLabel;
+        addImageBtn.disabled = false;
+      }
+    });
+    root.querySelector(".fh-step-editor-close").addEventListener("click", () => {
+      const onCancel = this._fhStepEditorOnCancel;
+      this._closeFhStepEditor();
+      if (onCancel) onCancel();
+    });
+    root.querySelector(".fh-step-editor-cancel-btn").addEventListener("click", () => {
+      const onCancel = this._fhStepEditorOnCancel;
+      this._closeFhStepEditor();
+      if (onCancel) onCancel();
+    });
+    root.querySelector(".fh-step-editor-save-btn").addEventListener("click", () => {
+      const blocks = (this._fhStepEditorBlocks || []).filter((b) => b.type === "divider" || b.type === "image" || (b.text && b.text.trim()));
+      const onSave = this._fhStepEditorOnSave;
+      this._closeFhStepEditor();
+      if (onSave) onSave(blocks);
+    });
     root.querySelector(".grocy-recipe-viewer-delete-btn").addEventListener("click", () => {
       const recipe = this._grocyRecipeViewerSourceRecipe;
       if (!recipe) return;
@@ -2338,6 +2975,11 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     root.querySelector(".rb-editor-cancel-btn").addEventListener("click", () => this._closeRecipeBoxEditor());
     root.querySelector(".rb-editor-save-btn").addEventListener("click", () => this._saveRecipeBoxEditor());
     root.querySelector(".rb-editor-delete-btn").addEventListener("click", () => this._deleteRecipeBoxEditorDish());
+    root.querySelector(".rb-editor-edit-steps-btn").addEventListener("click", () => {
+      this._fhOpenStepEditor(this._editingDishSteps || [], (blocks) => {
+        this._editingDishSteps = blocks;
+      });
+    });
     this._recipeBoxCategory = "All";
     this._renderRecipeBoxCategoryChips();
     this._updateRecipeBoxViewButtons();
@@ -2373,7 +3015,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     };
   }
   _defaultSettings() {
-    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "liquidglass" };
+    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "slate" };
   }
   _getSettings() {
     return this._settingsCache || this._defaultSettings();
@@ -2399,7 +3041,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     });
     const cardOpacity = typeof g.cardOpacity === "number" ? g.cardOpacity : 100;
     const glassBlur = typeof g.glassBlur === "number" ? g.glassBlur : 0;
-    return { colors, cardOpacity, glassBlur };
+    return { colors, cardOpacity, glassBlur, background: g.background || null };
   }
   _resolveTheme(settings) {
     const local = settings.theme || this._defaultTheme();
@@ -2442,6 +3084,17 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     if (deviceOverride) return `device:${deviceOverride}`;
     return "household";
   }
+  _fhThemeBgVars(bg) {
+    const img = bg && typeof bg.image === "string" && bg.image ? bg.image : "";
+    if (!img) return { "--fc-bg-image": "none", "--fc-bg-overlay-image": "none", "--fc-bg-size": "cover", "--fc-bg-position": "center" };
+    const ov = this._hexToRgba(/^#[0-9a-fA-F]{6}$/.test(bg.overlayColor || "") ? bg.overlayColor : "#000000", Number(bg.overlayOpacity) || 0);
+    return {
+      "--fc-bg-image": `url("${img.replace(/"/g, '\\"')}")`,
+      "--fc-bg-overlay-image": `linear-gradient(${ov}, ${ov})`,
+      "--fc-bg-size": bg.size === "repeat" ? "auto" : bg.size || "cover",
+      "--fc-bg-position": bg.position || "center",
+    };
+  }
   _applyThemeVars() {
     if (!this._root) return;
     const theme = this._resolveTheme(this._getSettings());
@@ -2455,6 +3108,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
     const vars = {
       "--fc-bg": theme.colors.bg,
       "--fc-card": this._hexToRgba(theme.colors.card, cardOpacity / 100),
+      "--fc-card-menu": this._hexToRgba(theme.colors.card, Math.max(cardOpacity, 88) / 100),
       "--fc-border": theme.colors.border,
       "--fc-text": theme.colors.text,
       "--fc-text-secondary": theme.colors.textSecondary,
@@ -2466,6 +3120,14 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       "--fc-surface2": this._hexToRgba(theme.colors.surface2, cardOpacity / 100),
       "--fc-glass-blur": `${glassBlur}px`,
     };
+        // v1.168.79 - the theme's own background image (the Liquid Glass
+    // aurora, or any image a theme sets in Theme Builder) now paints
+    // behind this card too, not just the calendar/Today cards - without
+    // it a glass theme's translucent surfaces only had a flat color to
+    // show through, so nothing looked like glass. Always set (to "none"
+    // when there's no image) so a cached earlier theme can't leave a
+    // stale image behind.
+    Object.assign(vars, this._fhThemeBgVars(theme.background));
     Object.keys(vars).forEach((name) => this.style.setProperty(name, vars[name]));
     // only cache once `_hass` is actually set. `_build()` (see its
     // own comment) calls this method once synchronously, before `hass` is
@@ -2606,7 +3268,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
         display: block; font-family: inherit;
       }
       * { box-sizing: border-box; }
-      ha-card { background: var(--fc-bg); color: var(--fc-text); border-radius: 14px; padding: 16px; }
+      ha-card { background: var(--fc-bg); background-image: var(--fc-bg-overlay-image, none), var(--fc-bg-image, none); background-size: cover, var(--fc-bg-size, cover); background-position: center, var(--fc-bg-position, center); color: var(--fc-text); border-radius: 14px; padding: 16px; }
       .fh-recipe-box-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
       .fh-recipe-box-title { font-size: 1.25em; font-weight: 800; }
       .recipe-box-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
@@ -2655,7 +3317,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       .recipe-card.is-selected, .recipe-row.is-selected { outline: 3px solid var(--fc-accent); }
       .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(40,34,20,0.45); z-index: 1000; align-items: center; justify-content: center; }
       .modal-overlay.open { display: flex; }
-      .modal-box { position: relative; background: var(--fc-card); color: var(--fc-text); border-radius: 14px; padding: 24px 22px 18px; width: min(92vw, 480px); max-height: 85vh; overflow-y: auto; box-shadow: 0 8px 30px rgba(58,53,44,0.3); }
+      .modal-box { position: relative; background: var(--fc-card-menu, var(--fc-card)); color: var(--fc-text); border-radius: 14px; padding: 24px 22px 18px; width: min(92vw, 480px); max-height: 85vh; overflow-y: auto; box-shadow: 0 8px 30px rgba(58,53,44,0.3); }
       .modal-close { position: absolute; top: 10px; right: 10px; width: 36px; height: 36px; border-radius: 50%; border: none; background: var(--fc-surface-alt); color: var(--fc-text); font-size: 18px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: var(--fc-shadow); }
       .modal-box h2 { margin: 0 26px 14px 0; font-size: 1.2em; color: var(--fc-text); }
       .modal-actions { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
@@ -2674,14 +3336,18 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       .rating-row { display: flex; gap: 10px; margin-top: 12px; }
       .rating-btn { flex: 1 1 auto; min-height: 48px; border-radius: 10px; border: 2px solid var(--fc-border); background: var(--fc-card); font-size: 22px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; box-shadow: var(--fc-shadow); }
       .rating-btn.active-up { background: #f2ddd4; border-color: #cf8f6c; }
-      // the full in-card Grocy Recipe Viewer's CSS, copied
-      // verbatim from family-week-calendar-card.js's own rules for these
-      // same classes (the markup and the shared methods that populate it
-      // are the exact same ones too) - see this file's own top comment.
-      // --fh-header-offset (the calendar card's kiosk-mode header height)
-      // has no equivalent on this card, so its var() fallback (0px) is
-      // always what applies here - correct, since this card has no such
-      // header to offset around.
+      /* v1.118.0+: the full in-card Grocy Recipe Viewer's CSS, copied
+         verbatim from family-week-calendar-card.js's own rules for these
+         same classes (the markup and the shared methods that populate it
+         are the exact same ones too) - see this file's own top comment.
+         --fh-header-offset (the calendar card's kiosk-mode header height)
+         has no equivalent on this card, so its var() fallback (0px) is
+         always what applies here - correct, since this card has no such
+         header to offset around. (Was a // JS-style comment, which isn't
+         valid CSS - browsers silently stop parsing the stylesheet right
+         there, which is why none of the Grocy Recipe Viewer's styling
+         below this point ever actually applied. Fixed to a real CSS
+         block comment.) */
       .grocy-recipe-viewer-overlay { top: var(--fh-header-offset, 0px); z-index: 1002; align-items: stretch; justify-content: stretch; padding: 0; }
       .grocy-recipe-viewer-overlay .modal-box { background: var(--fc-bg); width: 100%; max-width: 100%; height: calc(100vh - var(--fh-header-offset, 0px)); max-height: calc(100vh - var(--fh-header-offset, 0px)); border-radius: 0; box-shadow: none; box-sizing: border-box; padding: 28px max(22px, calc(50% - 380px)) 60px; overflow-y: auto; }
       .grocy-recipe-viewer-overlay .grocy-recipe-viewer-close { position: fixed; top: calc(14px + var(--fh-header-offset, 0px)); right: 14px; }
@@ -2719,7 +3385,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       .grocy-recipe-viewer-photo { display: none; flex: 1 1 260px; min-width: 220px; max-width: 100%; max-height: 320px; object-fit: cover; border-radius: 12px; align-self: flex-start; }
       .grocy-recipe-viewer-status { font-size: 12px; color: var(--fc-text-secondary); padding: 2px 2px 10px; text-align: center; }
       .grocy-recipe-viewer-status.is-error { color: #b5583c; }
-      /* Prep/Cook/Total stat pills () - only ever populated with real
+      /* Prep/Cook/Total stat pills (task #250) - only ever populated with real
       values parsed off the recipe (see _renderGrocyRecipeDetail); a recipe with
       none of the three published stays an empty, invisible row via :empty
       rather than showing a blank card, same treatment as every other optional
@@ -2729,7 +3395,7 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       .grocy-recipe-stat { background: var(--fc-surface-alt); border: 1px solid var(--fc-border); border-radius: 10px; padding: 8px 18px; text-align: center; min-width: 78px; }
       .grocy-recipe-stat-label { display: block; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fc-text-secondary); margin-bottom: 2px; }
       .grocy-recipe-stat-value { display: block; font-size: 15px; font-weight: 800; color: var(--fc-text); }
-      /* Two-column reading layout () - ingredients (with their own
+      /* Two-column reading layout (task #251) - ingredients (with their own
       scaler) on one side, hero photo on the other; wraps to a single stacked
       column on narrow widths via flex-wrap, and the photo simply isn't in the
       DOM's visible flow at all when the recipe has none (display:none above),
@@ -2745,22 +3411,51 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       .grocy-recipe-viewer-ingredients { margin-bottom: 14px; }
       .grocy-recipe-ingredient-group { font-size: 12px; font-weight: 700; color: var(--fc-text-secondary); text-transform: uppercase; letter-spacing: 0.03em; margin: 10px 0 4px; }
       .grocy-recipe-ingredient-group:first-child { margin-top: 0; }
-      .grocy-recipe-ingredient-row { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; font-size: 14px; color: var(--fc-text); border-bottom: 1px solid var(--fc-border); }
-      /* Numbered circular badge (/mockup) standing in for the plain
+      .grocy-recipe-ingredient-row { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; font-size: 14px; color: var(--fc-text); border-bottom: 1px solid var(--fc-border); cursor: pointer; }
+      .grocy-recipe-ingredient-check { margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; }
+      .grocy-recipe-ingredient-row.checked-off { opacity: 0.5; }
+      .grocy-recipe-ingredient-row.checked-off .grocy-recipe-ingredient-amount,
+      .grocy-recipe-ingredient-row.checked-off > span:last-child { text-decoration: line-through; }
+      /* Numbered circular badge (task #251/mockup) standing in for the plain
       amount text that used to lead each row - the amount itself moved into the
       row's second line/span alongside the product name so nothing that used to
       be shown is lost, just restyled. */
       .grocy-recipe-ingredient-badge { flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%; background: var(--fc-accent); color: var(--fc-accent-text); font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-top: 1px; }
       .grocy-recipe-ingredient-amount { font-weight: 600; color: var(--fc-text-secondary); }
       .grocy-recipe-ingredient-note { font-size: 12px; color: var(--fc-text-secondary); font-style: italic; }
-      /* Numbered Instructions steps () - parsed from the recipe's own
+      /* Numbered Instructions steps (task #252) - parsed from the recipe's own
       "Preparation" block when it has one (see _renderGrocyRecipeDescription);
       recipes without that exact structure never populate this element at all,
       so it stays empty/invisible via :empty and the raw description below
       carries the full instructions instead, same as before this feature. */
       .grocy-recipe-viewer-instructions:empty { display: none; }
       .grocy-recipe-instructions-title { font-size: 1.1em; font-weight: 800; color: var(--fc-accent); margin: 6px 0 10px; }
-      .grocy-recipe-instruction-row { display: flex; align-items: flex-start; gap: 12px; padding: 8px 0; font-size: 14px; line-height: 1.5; color: var(--fc-text); }
+      .grocy-recipe-instruction-row { display: flex; align-items: flex-start; gap: 12px; padding: 8px 0; font-size: 14px; line-height: 1.5; color: var(--fc-text); cursor: pointer; }
+      .grocy-recipe-instruction-check { margin-top: 5px; width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; }
+      .grocy-recipe-instruction-row.checked-off { opacity: 0.5; }
+      .grocy-recipe-instruction-row.checked-off .grocy-recipe-instruction-text { text-decoration: line-through; }
+      .grocy-recipe-step-header { font-size: 1.05em; font-weight: 800; color: var(--fc-text); margin: 14px 0 4px; }
+      .grocy-recipe-step-divider { border: none; border-top: 1px solid var(--fc-border); margin: 14px 0; }
+      .grocy-recipe-step-image-wrap { margin: 10px 0; }
+      .grocy-recipe-step-image { max-width: 100%; border-radius: 10px; display: block; }
+      .fh-step-editor-overlay { top: var(--fh-header-offset, 0px); z-index: 1002; align-items: stretch; justify-content: stretch; padding: 0; }
+      .fh-step-editor-overlay .fh-step-editor-box { background: var(--fc-bg); width: 100%; max-width: 100%; height: calc(100vh - var(--fh-header-offset, 0px)); max-height: calc(100vh - var(--fh-header-offset, 0px)); border-radius: 0; box-shadow: none; box-sizing: border-box; padding: 28px max(22px, calc(50% - 380px)) 60px; overflow-y: auto; }
+      .fh-step-editor-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 14px; }
+      .fh-step-editor-row { display: flex; align-items: flex-start; gap: 8px; background: var(--fc-surface-alt, #f5f5f5); border-radius: 10px; padding: 8px; }
+      .fh-step-editor-drag-handle { flex: 0 0 auto; cursor: grab; touch-action: none; padding: 4px 6px; margin-top: 4px; font-size: 18px; line-height: 1; color: var(--fc-text-secondary, #888); user-select: none; }
+      .fh-step-editor-row.fh-step-editor-dragging { opacity: 0.5; box-shadow: 0 6px 16px rgba(0,0,0,0.25); }
+      .fh-step-editor-text-input { flex: 1; min-height: 44px; resize: vertical; font-family: inherit; font-size: 14px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--fc-border); }
+      .fh-step-editor-header-input { flex: 1; font-weight: 800; font-size: 14px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--fc-border); }
+      .fh-step-editor-step-num { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 50%; background: var(--fc-accent); color: var(--fc-accent-text); font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-top: 8px; }
+      .fh-step-editor-divider-row { justify-content: space-between; align-items: center; }
+      .fh-step-editor-divider-label { color: var(--fc-text-muted, #888); font-size: 13px; flex: 1; text-align: center; }
+      .fh-step-editor-image-row { align-items: center; }
+      .fh-step-editor-image-preview { flex: 1; max-width: 100%; max-height: 120px; border-radius: 8px; object-fit: cover; }
+      .fh-step-editor-row-controls { display: flex; gap: 4px; flex-shrink: 0; }
+      .fh-step-editor-row-controls button { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--fc-border); background: var(--fc-bg); cursor: pointer; font-size: 13px; padding: 0; }
+      .fh-step-editor-row-controls button:disabled { opacity: 0.35; cursor: default; }
+      .fh-step-editor-add-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+      .fh-step-editor-add-row button { flex: 1 1 auto; }
       .grocy-recipe-instruction-badge { flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; background: var(--fc-accent); color: var(--fc-accent-text); font-size: 13px; font-weight: 800; display: flex; align-items: center; justify-content: center; margin-top: 1px; }
       .grocy-recipe-instruction-text { padding-top: 3px; }
       .grocy-recipe-viewer-description { font-size: 14px; line-height: 1.5; color: var(--fc-text); }
@@ -2781,11 +3476,12 @@ class FamilyHubRecipeBoxCard extends HTMLElement {
       .grocy-recipe-viewer-overlay .grocy-recipe-instruction-row { font-size: 15px; }
       .grocy-recipe-viewer-overlay .grocy-recipe-viewer-description { font-size: 16px; line-height: 1.6; }
       .grocy-recipe-viewer-overlay .grocy-recipe-viewer-footer { max-width: 320px; margin: 14px auto 0; }
-      // Base accordion/section-label classes the ingredients-accordion
-      // rules above build on (.grocy-recipe-ingredients-accordion
-      // .accordion-toggle/.accordion-body) - also copied verbatim from the
-      // calendar card, which already has these for its OTHER accordions
-      // (this card had none before now).
+      /* Base accordion/section-label classes the ingredients-accordion
+         rules above build on (.grocy-recipe-ingredients-accordion
+         .accordion-toggle/.accordion-body) - also copied verbatim from the
+         calendar card, which already has these for its OTHER accordions
+         (this card had none before now). (Same // -> CSS-comment fix as
+         above.) */
       .theme-section-label { font-size: 13px; font-weight: 800; color: var(--fc-text); margin: 6px 0 8px; text-transform: uppercase; letter-spacing: 0.02em; }
       .accordion-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; background: var(--fc-surface-alt); border: none; border-radius: 10px; padding: 10px 12px; cursor: pointer; box-shadow: var(--fc-shadow); }
       .accordion-toggle .theme-section-label { margin: 0; }

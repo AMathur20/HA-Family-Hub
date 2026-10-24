@@ -1,3 +1,71 @@
+// ---- Family Hub shared translation helper (v1.168.76) -------------------
+// __fhT(key, english, vars, mode) looks a string up in Home Assistant's
+// loaded "fh_ui" translations (translations/<language>.json → fh_ui.text.*)
+// and falls back to the English text written right here in the source.
+// vars fill %0%, %1%, ... placeholders. mode "h" escapes the translated
+// text (not the vars, which callers already prepared) for use inside HTML
+// markup or an attribute value. Identical copy in every Family Hub card and
+// in the Theme Builder panel - whichever loads first sets it up.
+// __fhSweep(root) re-translates markup that was drawn before the language
+// file finished loading (elements tagged data-fh-t / data-fh-title /
+// data-fh-placeholder / data-fh-aria / data-fh-alt), but only while they
+// still show the English original, so text a card later replaced with
+// something else is never overwritten.
+var __fhI18n = (window.__familyHubI18n = window.__familyHubI18n || { hass: null, fb: {}, loading: null, loaded: null });
+var __fhEsc = function (s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+};
+var __fhT = function (key, fb, vars, mode) {
+  var g = window.__familyHubI18n || __fhI18n;
+  if (g.fb[key] === undefined) g.fb[key] = fb;
+  var str = "";
+  try {
+    if (g.hass && typeof g.hass.localize === "function") str = g.hass.localize("component.family_hub.fh_ui." + key) || "";
+  } catch (e) {
+    str = "";
+  }
+  if (!str) str = fb;
+  if (mode === "h") str = __fhEsc(str);
+  if (vars) {
+    Object.keys(vars).forEach(function (k) {
+      var v = vars[k];
+      str = str.split("%" + k + "%").join(v === null || v === undefined ? "" : String(v));
+    });
+  }
+  return str;
+};
+var __fhUseHass = function (hass) {
+  if (hass && typeof hass.localize === "function") (window.__familyHubI18n || __fhI18n).hass = hass;
+};
+var __fhSweep = function (root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  var g = window.__familyHubI18n || __fhI18n;
+  root.querySelectorAll("[data-fh-t]").forEach(function (el) {
+    var key = el.getAttribute("data-fh-t");
+    var fb = g.fb[key];
+    if (fb === undefined) return;
+    var cur = (el.textContent || "").trim();
+    if (cur !== fb && cur !== el.__fhShown) return;
+    var next = __fhT(key, fb);
+    if (cur !== next) el.textContent = next;
+    el.__fhShown = next;
+  });
+  [["data-fh-title", "title"], ["data-fh-placeholder", "placeholder"], ["data-fh-aria", "aria-label"], ["data-fh-alt", "alt"]].forEach(function (pair) {
+    root.querySelectorAll("[" + pair[0] + "]").forEach(function (el) {
+      var key = el.getAttribute(pair[0]);
+      var fb = g.fb[key];
+      if (fb === undefined) return;
+      var cur = el.getAttribute(pair[1]);
+      var shownKey = "__fhShown_" + pair[1];
+      if (cur !== fb && cur !== el[shownKey]) return;
+      var next = __fhT(key, fb);
+      if (cur !== next) el.setAttribute(pair[1], next);
+      el[shownKey] = next;
+    });
+  });
+};
+// -------------------------------------------------------------------------
+
 (function () {
   if (window.__familyCalendarFontLoaded) return;
   window.__familyCalendarFontLoaded = true;
@@ -36,18 +104,38 @@ const REMINDER_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
 // it silently never rang for anyone else's widened timer alarm. Kept
 // byte-identical to every other card's copy on purpose.
 if (!window.__familyHubTimerAlarm) {
+  // v1.168.74 (timer + alarm overhaul): the on-screen half of a Family Hub
+  // timer alarm - a full-screen "time's up" with a looping alarm sound that
+  // keeps going until someone taps Stop, shared by every Family Hub card on
+  // the page (one modal, one sound, appended to document.body).
+  //
+  // A screen rings when the backend's family_hub_timer_alarm_ring event
+  // says so: it's the screen that started the timer (origin_client_id =
+  // this tab's id), it's logged in as one of target_user_ids (the owner, a
+  // kiosk login on a "kiosks" alarm), or broadcast_all ("everyone"). The
+  // tab that started a timer also rings on its own the instant its local
+  // countdown reaches zero (check()), so there's no wait for the server.
+  // Several alarms at once each get their own row and Stop button. Stop
+  // here stops it everywhere (screens, phones, speakers).
   window.__familyHubTimerAlarm = (function () {
     let modalEl = null;
     let audioCtx = null;
     let beepHandle = null;
-    let activeUid = null;
-    // A timer's uid, once dismissed, stays dismissed - otherwise the very
-    // next poll's countdown tick (still <= 0 for a few more seconds until
-    // the backend's own sweep, up to TIMER_SWEEP_SECONDS later, actually
-    // removes it from family_hub/timers/list) would immediately re-open
-    // the modal a person just tapped Stop on. Unbounded but negligible: a
-    // few bytes per timer this ONE tab ever alarmed for in its lifetime.
+    const ringing = new Map(); // uid -> {title, body}
     const dismissedUids = new Set();
+    let lastHass = null;
+    function myClientId() {
+      try {
+        let id = sessionStorage.getItem("family_hub_client_id");
+        if (!id) {
+          id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          sessionStorage.setItem("family_hub_client_id", id);
+        }
+        return id;
+      } catch (e) {
+        return "";
+      }
+    }
     function ensureModal() {
       if (modalEl) return modalEl;
       modalEl = document.createElement("div");
@@ -58,28 +146,57 @@ if (!window.__familyHubTimerAlarm) {
         background: "rgba(20,16,8,0.78)",
       });
       modalEl.innerHTML =
-        '<div style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:38px 30px;max-width:360px;width:88vw;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
-        '<div style="font-size:48px;margin-bottom:12px;">&#9200;</div>' +
-        '<div class="fh-timer-alarm-title" style="font-size:1.3em;font-weight:800;margin-bottom:6px;"></div>' +
-        '<div style="font-size:14px;color:#96877a;margin-bottom:24px;">Time\'s up!</div>' +
-        '<button type="button" class="fh-timer-alarm-stop" style="min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;">Stop</button>' +
+        '<div class="fh-timer-alarm-box" role="alertdialog" aria-live="assertive" style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:30px 26px;max-width:400px;width:88vw;max-height:86vh;overflow:auto;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
+        '<div style="font-size:48px;margin-bottom:6px;">&#9200;</div>' +
+        ('<div data-fh-t="text.time_s_up" class="fh-timer-alarm-head" style="font-size:14px;color:#96877a;margin-bottom:14px;font-weight:700;">' + __fhT("text.time_s_up", "Time's up!", null, "h") + '</div>') +
+        '<div class="fh-timer-alarm-list" style="display:flex;flex-direction:column;gap:12px;"></div>' +
+        ('<button data-fh-t="text.stop_all" type="button" class="fh-timer-alarm-stop-all" style="display:none;margin-top:16px;min-height:46px;width:100%;border:2px solid #8f5a00;border-radius:14px;background:transparent;color:#8f5a00;font-size:16px;font-weight:800;cursor:pointer;">' + __fhT("text.stop_all", "Stop all", null, "h") + '</button>') +
         "</div>";
       document.body.appendChild(modalEl);
-      modalEl.querySelector(".fh-timer-alarm-stop").addEventListener("click", () => stop());
+      modalEl.addEventListener("click", (e) => {
+        const btn = e.target.closest && e.target.closest("button");
+        if (!btn) return;
+        if (btn.classList.contains("fh-timer-alarm-stop-all")) {
+          Array.from(ringing.keys()).forEach((uid) => stop(uid));
+        } else if (btn.dataset.uid) {
+          stop(btn.dataset.uid);
+        }
+      });
       return modalEl;
     }
-    // A plain oscillator beep via the Web Audio API - deliberately not a
-    // bundled sound file: no extra media asset for HACS/manual installs to
-    // ship or for a self-hosted install's network policy to worry about,
-    // and it sounds identical on every install.
-    //
-    // The original v1.119.0+ sound was one
-    // flat square-wave tone repeated once a second - metronomic, which is
-    // exactly what read as a countdown-bomb tick rather than an alarm. This
-    // plays a quick alternating two-pitch TRIPLET (a classic digital-alarm-
-    // clock trill) each cycle instead of a single tone, which is what
-    // actually reads as "alarm" to the ear - the alternating pitch is what
-    // a lone repeated tone can't give you, no matter how loud.
+    function render() {
+      const el = ensureModal();
+      if (!ringing.size) {
+        el.style.display = "none";
+        return;
+      }
+      const list = el.querySelector(".fh-timer-alarm-list");
+      list.innerHTML = "";
+      ringing.forEach((info, uid) => {
+        const row = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "fh-timer-alarm-title";
+        title.style.cssText = "font-size:1.3em;font-weight:800;margin-bottom:4px;overflow-wrap:anywhere;";
+        title.textContent = info.title || __fhT("text.timer", "Timer");
+        row.appendChild(title);
+        if (info.body) {
+          const body = document.createElement("div");
+          body.style.cssText = "font-size:14px;color:#6b5f52;margin-bottom:10px;overflow-wrap:anywhere;";
+          body.textContent = info.body;
+          row.appendChild(body);
+        }
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "fh-timer-alarm-stop";
+        btn.dataset.uid = uid;
+        btn.textContent = __fhT("text.stop", "Stop");
+        btn.style.cssText = "min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;";
+        row.appendChild(btn);
+        list.appendChild(row);
+      });
+      el.querySelector(".fh-timer-alarm-stop-all").style.display = ringing.size > 1 ? "" : "none";
+      el.style.display = "flex";
+    }
     function playBeep(atTime, freq) {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
@@ -93,10 +210,7 @@ if (!window.__familyHubTimerAlarm) {
       osc.start(atTime);
       osc.stop(atTime + 0.15);
     }
-    // Scheduled via Web Audio's own clock (osc.start(atTime)) rather than
-    // three back-to-back setTimeout calls, so the triplet's timing stays
-    // tight even if the main JS thread is briefly busy - it's the crisp,
-    // even spacing that makes it read as a trill instead of a stutter.
+    // A two-pitch alarm-clock trill via Web Audio (no sound file to ship).
     function beepOnce() {
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -104,57 +218,11 @@ if (!window.__familyHubTimerAlarm) {
         const now = audioCtx.currentTime;
         [[0, 1046], [0.15, 1318], [0.3, 1046]].forEach(([offset, freq]) => playBeep(now + offset, freq));
       } catch (e) {
-        // Autoplay blocked, or no Web Audio at all - the modal is still
-        // the primary alarm; sound is a bonus on top of it, not required.
+        // Autoplay blocked or no Web Audio - the modal is still the alarm.
       }
     }
-    // which hass connection to tell "dismiss this everywhere"
-    // when Stop is tapped - set by whichever card most recently called
-    // ring()/check() with one, since this singleton is shared across every
-    // card on the dashboard and any of them may have `hass` by now. Best-
-    // effort only (see stop() below): a same-tab-only local alarm (the
-    // original v1.119.0+ behavior this singleton already had) never had a
-    // server-side record to begin with, so the dismiss call below simply
-    // no-ops for it (ws_dismiss_timer_alarm pops a uid that was never
-    // registered - see its own docstring for why that's silent, not an
-    // error).
-    let lastHass = null;
-    function stop() {
-      if (activeUid) dismissedUids.add(activeUid);
-      const uid = activeUid;
-      activeUid = null;
-      if (beepHandle) {
-        clearInterval(beepHandle);
-        beepHandle = null;
-      }
-      if (modalEl) modalEl.style.display = "none";
-      // household's explicit choice - "first tap wins, from
-      // anyone" - so tapping Stop here also clears the alarm everywhere
-      // else (other kiosks, other people's phones-that-are-dashboards)
-      // rather than just silencing this one tab. No permission gate, by
-      // design.
-      if (uid && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
-        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
-      }
-    }
-    // This modal already outranks the screensaver's own overlay (z-index
-    // 2147483647 vs 2147483000, set in ensureModal() above), so it was
-    // always painting on top of it - but a screensaver left running
-    // underneath still means its video/camera poll keeps going, so it
-    // needs to actually END, not just be covered up.
-    // There are THREE independent screensaver implementations in this
-    // project (the calendar card's own, the shared window.__familyHub
-    // ScreenSaver controller used by Chores/Rewards/My Chores/etc., and the
-    // standalone family-screensaver-card.js) and this singleton has no
-    // reference to whichever one might be running on this particular
-    // dashboard. Rather than importing all three, every one of them marks
-    // its overlay element with the same data-family-hub-screensaver
-    // attribute and already dismisses itself (hides, stops video/camera
-    // polling, navigates to its configured return dashboard) on its own
-    // overlay's "pointerdown" listener - so a synthetic pointerdown on
-    // whichever overlay is actually showing reuses each implementation's
-    // own real dismiss path for free, with zero coupling to which one it
-    // is.
+    // Ends whichever Family Hub screensaver is showing (they all close on
+    // pointerdown on their own overlay).
     function wakeAnyScreenSaver() {
       try {
         const overlay = document.querySelector("[data-family-hub-screensaver]");
@@ -162,75 +230,72 @@ if (!window.__familyHubTimerAlarm) {
           overlay.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
         }
       } catch (e) {
-        // Best-effort - worst case the alarm modal still shows ON TOP of a
-        // running screensaver rather than ending it outright.
+        // best-effort
       }
     }
-    function start(timer, hass) {
+    function start(uid, title, body, hass) {
       if (hass) lastHass = hass;
-      if (activeUid === timer.uid) return;
-      activeUid = timer.uid;
+      if (!uid || dismissedUids.has(uid)) return;
+      const isNew = !ringing.has(uid);
+      ringing.set(uid, { title: title || (ringing.get(uid) || {}).title || "Timer", body: body || (ringing.get(uid) || {}).body || "" });
+      if (!isNew) return;
       wakeAnyScreenSaver();
-      const el = ensureModal();
-      el.querySelector(".fh-timer-alarm-title").textContent = timer.title || "Timer";
-      el.style.display = "flex";
-      beepOnce();
-      if (beepHandle) clearInterval(beepHandle);
-      // Shorter gap than the old single-tone version (1200ms) since each
-      // cycle is now a ~450ms triplet, not a single ~340ms tone - this
-      // keeps the alarm feeling urgent/continuous rather than sparse.
-      beepHandle = setInterval(beepOnce, 950);
+      render();
+      if (!beepHandle) {
+        beepOnce();
+        beepHandle = setInterval(beepOnce, 950);
+      }
+    }
+    function stop(uid) {
+      if (!uid) return;
+      dismissedUids.add(uid);
+      const had = ringing.delete(uid);
+      if (!ringing.size && beepHandle) {
+        clearInterval(beepHandle);
+        beepHandle = null;
+      }
+      render();
+      if (had && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
+        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
+      }
     }
     return {
-      // Call once a second from a card's own countdown ticker (the same
-      // tick that already repaints the visible "X:XX left" text), passing:
-      //   timers        - that card's own freshly-fetched timers list
-      //   clientId      - this tab's own id (see _familyHubClientId below)
-      //   remainingSecondsFn - a (timer) => seconds function, so this
-      //                   singleton reuses the CALLING card's own
-      //                   native-timer-aware math (_timerRemainingSeconds)
-      //                   instead of a second, potentially-drifting copy
-      //                   of it living here with no access to `hass`.
-      // Only a timer whose origin_client_id matches THIS tab's own id and
-      // whose alarm flag is on can ever trigger anything - a timer someone
-      // else started, or one this same tab started but didn't opt into
-      // alarms for, is silently ignored here exactly as before this
-      // feature existed.
+      // From a card's 1-second countdown tick: the tab that started a timer
+      // rings the moment it reaches zero (any timer it started, alarm-style
+      // or not, assigned or not).
       check(timers, clientId, remainingSecondsFn, hass) {
-        if (!clientId) return;
-        const mine = (timers || []).find((t) => t.alarm && t.origin_client_id && t.origin_client_id === clientId);
-        if (!mine || dismissedUids.has(mine.uid)) return;
-        if (remainingSecondsFn(mine) <= 0) start(mine, hass);
+        if (hass) lastHass = hass;
+        const me = clientId || myClientId();
+        if (!me) return;
+        (timers || []).forEach((t) => {
+          if (t && t.origin_client_id && t.origin_client_id === me && !dismissedUids.has(t.uid) && remainingSecondsFn(t) <= 0) {
+            start(t.uid, t.title || "Timer", "", hass);
+          }
+        });
       },
-      // the WIDENED half - a household_timer_alarm_ring bus
-      // event (fired by chores_websocket_api.py's _dispatch_timer_alarm/
-      // _reannounce_active_alarms) that THIS login should also ring for,
-      // because it's either the timer's own owner, a login flagged as an
-      // always-on alarm kiosk, or the tier was "everyone." Unlike check()
-      // above (which only ever recognizes the ONE tab that started the
-      // timer, by origin_client_id), this recognizes a login/account -
-      // every open tab logged in as a matching user rings, on every
-      // dashboard, which is the whole point of the widened tiers. Re-fired
-      // on every re-announcement (see _reannounce_active_alarms), so
-      // calling this again for an already-ringing uid is a deliberate
-      // no-op (start() already short-circuits on activeUid === timer.uid).
+      // The backend's ring event (and list_active_alarms on load).
       ringBroadcast(payload, hass, myUserId) {
         if (!payload || !payload.uid || dismissedUids.has(payload.uid)) return;
         const targets = payload.target_user_ids || [];
-        const shouldRing = !!payload.broadcast_all || (myUserId && targets.includes(myUserId));
+        const fromHere = !!payload.origin_client_id && payload.origin_client_id === myClientId();
+        const shouldRing = !!payload.broadcast_all || fromHere || (myUserId && targets.includes(myUserId));
         if (!shouldRing) return;
-        start({ uid: payload.uid, title: payload.title }, hass);
+        start(payload.uid, payload.timer_title || payload.title, payload.body, hass);
       },
-      // The STOP half of the same broadcast pair - fired the instant
-      // ANY device dismisses (see ws_dismiss_timer_alarm's own "first tap
-      // wins" docstring), including a dismiss that originated from THIS
-      // singleton's own stop() above (that call's own dismiss already
-      // covers this tab; the event still arrives here a moment later and
-      // is a harmless no-op via stop()'s own activeUid !== uid guard, or
-      // via dismissedUids already containing it).
+      // Someone stopped it somewhere else.
       stopFromServer(uid) {
-        if (uid) dismissedUids.add(uid);
-        if (activeUid === uid) stop();
+        if (!uid) return;
+        dismissedUids.add(uid);
+        if (ringing.delete(uid)) {
+          if (!ringing.size && beepHandle) {
+            clearInterval(beepHandle);
+            beepHandle = null;
+          }
+          render();
+        }
+      },
+      _ringing() {
+        return Array.from(ringing.keys());
       },
     };
   })();
@@ -497,24 +562,93 @@ class FamilyTodayCard extends HTMLElement {
     return (lang || "en").split("-")[0].toLowerCase();
   }
   _ensureTranslationsLoaded() {
+    __fhUseHass(this._hass);
     if (!this._hass || typeof this._hass.loadBackendTranslation !== "function") return;
     const lang = this._baseLanguage(this._hass.language);
-    if (this._i18nLoadedLang === lang || this._i18nLoading === lang) return;
+    if (this._i18nLoadedLang === lang) {
+      // v1.168.67 fix (GitHub issue #10 - "German localization on buttons
+      // only after click on settings"): Home Assistant hands cards the hass
+      // object that actually knows the newly loaded strings a moment AFTER
+      // loadBackendTranslation resolves, so the redraw in .then() below
+      // still ran with the old, English-only localize. Redraw once more
+      // whenever a new localize arrives for the already-loaded language.
+      if (this._hass.localize !== this._i18nLocalize) {
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
+      }
+      return;
+    }
+    if (this._i18nLoading === lang) return;
     this._i18nLoading = lang;
     this._hass
       .loadBackendTranslation("fh_ui", "family_hub")
       .then(() => {
         this._i18nLoadedLang = lang;
         this._i18nLoading = null;
-        this._applyTranslations();
-        this._render();
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
       })
       .catch((e) => {
         this._i18nLoading = null;
         console.warn("[family_hub] failed to load \"" + lang + "\" translations - staying on English fallback text", e);
       });
   }
+  // v1.168.67 (GitHub issue #10): dates and times follow the Home
+  // Assistant user's own language and time format (Profile > Language /
+  // Time format), not the browser's.
+  _uiLocale() {
+    const h = this._hass;
+    const lang = (h && h.locale && h.locale.language) || (h && h.language) || "";
+    return lang || undefined;
+  }
+  _uiHour12() {
+    const h = this._hass;
+    const tf = h && h.locale && h.locale.time_format;
+    if (tf === "12") return true;
+    if (tf === "24") return false;
+    if (tf === "system") {
+      try {
+        return new Intl.DateTimeFormat(undefined, { hour: "numeric" }).resolvedOptions().hour12;
+      } catch (e) {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+  _fmtDate(d, opts) {
+    try {
+      return d.toLocaleDateString(this._uiLocale(), opts);
+    } catch (e) {
+      return d.toLocaleDateString(undefined, opts);
+    }
+  }
+  _fmtTimeOfDay(d) {
+    const opts = { hour: "numeric", minute: "2-digit" };
+    const hour12 = this._uiHour12();
+    if (hour12 !== undefined) opts.hour12 = hour12;
+    try {
+      return d.toLocaleTimeString(this._uiLocale(), opts);
+    } catch (e) {
+      return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    }
+  }
+  _fmtDateTime(d) {
+    const opts = { year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" };
+    const hour12 = this._uiHour12();
+    if (hour12 !== undefined) opts.hour12 = hour12;
+    try {
+      return d.toLocaleString(this._uiLocale(), opts);
+    } catch (e) {
+      return d.toLocaleString();
+    }
+  }
+  // Redraws everything that shows translated text.
+  _onTranslationsReady() {
+    this._applyTranslations();
+    this._render();
+  }
   _applyTranslations() {
+    __fhSweep(this._root || this.shadowRoot);
     if (!this._root) return;
     this._root.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.dataset.i18n;
@@ -563,7 +697,7 @@ class FamilyTodayCard extends HTMLElement {
     try {
       const unsubRing = await this._hass.connection.subscribeEvents((event) => {
         if (window.__familyHubTimerAlarm) {
-          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, myUserId);
+          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, typeof this._myUserId === "function" ? this._myUserId() : myUserId);
         }
       }, "family_hub_timer_alarm_ring");
       const unsubStop = await this._hass.connection.subscribeEvents((event) => {
@@ -715,7 +849,7 @@ class FamilyTodayCard extends HTMLElement {
       people: [],
       theme: this._defaultTheme(),
       useGlobalTheme: true,
-      globalThemeId: "liquidglass",
+      globalThemeId: "slate",
     };
   }
   // Only reads the handful of shared-settings fields this card actually
@@ -793,7 +927,9 @@ class FamilyTodayCard extends HTMLElement {
       const n = typeof raw === "number" ? raw : parseInt(raw, 10);
       fonts[k] = Number.isFinite(n) && n >= 6 && n <= 72 ? n : defaultTheme.fonts[k];
     });
-    return { colors, fonts, effects: g.effects || null, background: g.background || null };
+    const cardOpacity = typeof g.cardOpacity === "number" ? g.cardOpacity : 100;
+    const glassBlur = typeof g.glassBlur === "number" ? g.glassBlur : 0;
+    return { colors, fonts, effects: g.effects || null, background: g.background || null, cardOpacity, glassBlur };
   }
   _resolveTheme(settings) {
     const local = settings.theme || this._defaultTheme();
@@ -855,7 +991,14 @@ class FamilyTodayCard extends HTMLElement {
     const settings = this._getSettings();
     const theme = this._resolveTheme(settings);
     this.style.setProperty("--fc-bg", theme.colors.bg);
-    this.style.setProperty("--fc-card", theme.colors.card);
+    // v1.168.79 - Liquid Glass support (cardOpacity/glassBlur): the
+    // rows and cards go translucent and blur the theme's background
+    // image, like the calendar. 100/0 (every other theme) is unchanged.
+    const cardOpacity = typeof theme.cardOpacity === "number" ? theme.cardOpacity : 100;
+    const glassBlur = typeof theme.glassBlur === "number" ? theme.glassBlur : 0;
+    this.style.setProperty("--fc-glass-blur", `${glassBlur}px`);
+    this.style.setProperty("--fc-card", (cardOpacity < 100 ? this._hexToRgba(theme.colors.card, cardOpacity / 100) : theme.colors.card));
+    this.style.setProperty("--fc-card-menu", (cardOpacity < 88 ? this._hexToRgba(theme.colors.card, 0.88) : cardOpacity < 100 ? this._hexToRgba(theme.colors.card, cardOpacity / 100) : theme.colors.card));
     this.style.setProperty("--fc-border", theme.colors.border);
     this.style.setProperty("--fc-text", theme.colors.text);
     this.style.setProperty("--fc-text-secondary", theme.colors.textSecondary);
@@ -863,8 +1006,8 @@ class FamilyTodayCard extends HTMLElement {
     this.style.setProperty("--fc-accent-text", theme.colors.accentText);
     this.style.setProperty("--fc-accent2", theme.colors.accent2);
     this.style.setProperty("--fc-accent3", theme.colors.accent3);
-    this.style.setProperty("--fc-surface-alt", theme.colors.surfaceAlt);
-    this.style.setProperty("--fc-surface2", theme.colors.surface2);
+    this.style.setProperty("--fc-surface-alt", (cardOpacity < 100 ? this._hexToRgba(theme.colors.surfaceAlt, cardOpacity / 100) : theme.colors.surfaceAlt));
+    this.style.setProperty("--fc-surface2", (cardOpacity < 100 ? this._hexToRgba(theme.colors.surface2, cardOpacity / 100) : theme.colors.surface2));
     this.style.setProperty("--fs-header-title", `${theme.fonts.headerTitle}px`);
     this.style.setProperty("--fs-event", `${theme.fonts.event}px`);
     this.style.setProperty("--fs-chip", `${theme.fonts.chip}px`);
@@ -903,6 +1046,7 @@ class FamilyTodayCard extends HTMLElement {
       const __familyHubCacheVarNames = [
       "--fc-bg",
       "--fc-card",
+      "--fc-card-menu",
       "--fc-border",
       "--fc-text",
       "--fc-text-secondary",
@@ -912,6 +1056,7 @@ class FamilyTodayCard extends HTMLElement {
       "--fc-accent3",
       "--fc-surface-alt",
       "--fc-surface2",
+      "--fc-glass-blur",
       "--fs-header-title",
       "--fs-event",
       "--fs-chip",
@@ -950,6 +1095,23 @@ class FamilyTodayCard extends HTMLElement {
   }
   async _fetchSettings() {
     if (!this._hass) return;
+    // v1.168.61 fix (same as family-right-now-card.js): read Family Hub's
+    // own live settings store first - the legacy "Settings" to-do item
+    // this used to read exclusively stopped being kept in sync when
+    // Settings moved into that store. The to-do copy is now only a
+    // fallback for an older backend or a never-saved install.
+    try {
+      const live = await this._hass.connection.sendMessagePromise({ type: "family_hub/get_settings" });
+      const liveSettings = live && live.settings && typeof live.settings === "object" ? live.settings : null;
+      if (liveSettings && Object.keys(liveSettings).length) {
+        this._settingsCache = this._normalizeSettings(liveSettings);
+        this._applyThemeVars();
+        this._renderHeader();
+        return;
+      }
+    } catch (e) {
+      // fall through to the legacy copy below
+    }
     try {
       const result = await this._hass.connection.sendMessagePromise({
         type: "call_service",
@@ -1402,7 +1564,7 @@ class FamilyTodayCard extends HTMLElement {
     return map[condition] || "";
   }
   _fmtTime(d) {
-    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    return this._fmtTimeOfDay(d);
   }
   // Client-side navigation to another dashboard/view, the same mechanism
   // Home Assistant's own frontend uses for a "navigate" tap action -
@@ -2138,6 +2300,7 @@ background-image: var(--fc-bg-overlay-image, none);
 .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fc-text-secondary); font-weight: 800; margin-bottom: 6px; }
 .row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: 10px; background: var(--fc-surface-alt); margin-bottom: 6px; cursor: pointer; box-sizing: border-box; }
 .row:last-child { margin-bottom: 0; }
+.row { backdrop-filter: blur(var(--fc-glass-blur, 0px)); -webkit-backdrop-filter: blur(var(--fc-glass-blur, 0px)); }
 .row .dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; }
 .row .label { flex: 1 1 auto; font-size: var(--fs-event, 14px); color: var(--fc-text); min-width: 0; overflow-wrap: break-word; }
 .row .meta { font-size: var(--fs-chip, 13px); color: var(--fc-text-secondary); flex: 0 0 auto; white-space: nowrap; }
@@ -2166,7 +2329,7 @@ background-image: var(--fc-bg-overlay-image, none);
 .go-to-calendar-btn, .footer-add-btn { flex: 1 1 auto; box-sizing: border-box; border: none; border-radius: 10px; background: var(--fc-accent); color: var(--fc-accent-text); font-size: var(--fs-event, 14px); font-weight: 700; padding: 11px 12px; cursor: pointer; box-shadow: var(--fc-shadow); font-family: inherit; }
 .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(40,34,20,0.45); z-index: 1000; align-items: center; justify-content: center; }
 .modal-overlay.open { display: flex; }
-.modal-box { position: relative; background: var(--fc-card); color: var(--fc-text); border-radius: 14px; padding: 20px 20px 16px; width: min(92vw, 380px); max-height: 80vh; overflow-y: auto; box-shadow: 0 8px 30px rgba(58,53,44,0.3); }
+.modal-box { position: relative; background: var(--fc-card-menu, var(--fc-card)); color: var(--fc-text); border-radius: 14px; padding: 20px 20px 16px; width: min(92vw, 380px); max-height: 80vh; overflow-y: auto; box-shadow: 0 8px 30px rgba(58,53,44,0.3); }
 .modal-close { position: absolute; top: 10px; right: 10px; border: none; background: var(--fc-surface-alt); color: var(--fc-text); width: 30px; height: 30px; border-radius: 8px; font-size: 14px; cursor: pointer; }
 .modal-box h2 { margin: 0 26px 14px 0; font-size: 1.2em; color: var(--fc-text); }
 .detail-title { font-size: 17px; font-weight: 800; margin: 0 24px 8px 0; }
@@ -2268,7 +2431,7 @@ background-image: var(--fc-bg-overlay-image, none);
 </div>
 <div class="field">
 <label data-i18n="today.add_event.title_label">Title</label>
-<input type="text" class="add-event-title" placeholder="e.g. Dentist appointment" maxlength="120" />
+<input data-fh-placeholder="text.e_g_dentist_appointment" type="text" class="add-event-title" placeholder="${__fhT("text.e_g_dentist_appointment", "e.g. Dentist appointment", null, "h")}" maxlength="120" />
 </div>
 <div class="add-event-tab-panel" data-tab-panel="calendar">
 <div class="field">
@@ -2302,7 +2465,7 @@ background-image: var(--fc-bg-overlay-image, none);
 </div>
 <div class="field">
 <label data-i18n="today.add_event.location_label">Location (optional)</label>
-<input type="text" class="add-event-location" placeholder="Optional" maxlength="120" />
+<input data-fh-placeholder="text.optional" type="text" class="add-event-location" placeholder="${__fhT("text.optional", "Optional", null, "h")}" maxlength="120" />
 </div>
 <div class="field add-event-remind-field">
 <label data-i18n="today.add_event.remind_me_label">Remind me</label>
@@ -2315,7 +2478,7 @@ background-image: var(--fc-bg-overlay-image, none);
 <label class="remind-check-opt"><input type="checkbox" class="remind-check" value="120" />2h</label>
 <label class="remind-check-opt"><input type="checkbox" class="remind-check" value="1440" />1d</label>
 </div>
-<div class="remind-hint" data-i18n="today.add_event.remind_hint">Needs the Family Hub integration installed to actually notify.</div>
+
 </div>
 <div class="field add-event-people-field">
 <label data-i18n="today.add_event.also_for_label">Also for</label>
@@ -2345,7 +2508,7 @@ background-image: var(--fc-bg-overlay-image, none);
 <div class="rolldays-btn-row add-event-reminder-rolldays">${this._rolldaysBtnsHtml([])}</div>
 </div>
 </div>
-<div class="remind-hint" data-i18n="today.add_event.reminder_hint">Saved as a to-do in Home Assistant, not an event on your calendar - fires once at this exact time, and you can mark it done or reschedule it anytime from Home Assistant's own To-do UI. Needs the Family Hub integration installed to actually notify; set reminder notify devices under Settings.</div>
+<div class="remind-hint" data-i18n="today.add_event.reminder_hint">Saved as a to-do in Home Assistant, not an event on your calendar - fires once at this exact time, and you can mark it done or reschedule it anytime from Home Assistant's own To-do UI. Who gets notified is set per person under Settings > Users.</div>
 <div class="add-event-warn add-event-reminder-missing-warn" style="display:none"></div>
 </div>
 <div class="field add-event-checklist-field">
@@ -2361,7 +2524,7 @@ background-image: var(--fc-bg-overlay-image, none);
 <div class="add-event-checklist-custom-field">
 <div class="add-event-checklist-items"></div>
 <div class="checklist-add-row">
-<input type="text" class="add-event-checklist-add-input" placeholder="e.g. Cleats" maxlength="200" />
+<input data-fh-placeholder="text.e_g_cleats" type="text" class="add-event-checklist-add-input" placeholder="${__fhT("text.e_g_cleats", "e.g. Cleats", null, "h")}" maxlength="200" />
 <button type="button" class="btn-cancel add-event-checklist-add-btn" data-i18n="common.add">Add</button>
 </div>
 </div>
@@ -2370,7 +2533,7 @@ background-image: var(--fc-bg-overlay-image, none);
 </div>
 <div class="field">
 <label data-i18n="today.add_event.notes_label">Notes (optional)</label>
-<textarea class="add-event-description" placeholder="Optional details" maxlength="255"></textarea>
+<textarea data-fh-placeholder="text.optional_details" class="add-event-description" placeholder="${__fhT("text.optional_details", "Optional details", null, "h")}" maxlength="255"></textarea>
 </div>
 <div class="add-event-error" style="display:none"></div>
 <div class="modal-actions">
@@ -2418,8 +2581,8 @@ background-image: var(--fc-bg-overlay-image, none);
   _renderHeader() {
     if (!this._root) return;
     const now = new Date();
-    this._root.querySelector(".date-title-text").textContent = this._config.title || "Today";
-    this._root.querySelector(".date-sub").textContent = now.toLocaleDateString(undefined, {
+    this._root.querySelector(".date-title-text").textContent = this._config.title || __fhT("text.today", "Today");
+    this._root.querySelector(".date-sub").textContent = this._fmtDate(now, {
       weekday: "long",
       month: "long",
       day: "numeric",

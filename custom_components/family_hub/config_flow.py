@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 
@@ -63,6 +65,7 @@ from .const import (
     CONF_GROCY_API_KEY,
     CONF_GROCY_URL,
     CONF_INITIAL_GOALS_IN_CHORES,
+    CONF_INITIAL_CALENDARS,
     CONF_INITIAL_GOALS_IN_REWARDS,
     CONF_INITIAL_MEMBER_USER_IDS,
     CONF_INITIAL_ROUTINES_ENABLED,
@@ -230,6 +233,9 @@ def _build_users_schema(members: list[dict[str, str]]) -> vol.Schema:
 # description_placeholders on a step reused once per member).
 _MEMBER_COLOR_FIELD = "member_color"
 _MEMBER_INCLUDE_FIELD = "member_include_in_chores"
+# v1.168.60: optional - this member's own calendar, which becomes their
+# column on the family calendar (their profile's primaryCalendar).
+_MEMBER_CALENDAR_FIELD = "member_calendar"
 
 
 def _build_member_profile_schema(default_color: str) -> vol.Schema:
@@ -242,6 +248,9 @@ def _build_member_profile_schema(default_color: str) -> vol.Schema:
                 )
             ),
             vol.Optional(_MEMBER_INCLUDE_FIELD, default=True): selector.BooleanSelector(),
+            vol.Optional(_MEMBER_CALENDAR_FIELD): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="calendar")
+            ),
         }
     )
 
@@ -536,6 +545,9 @@ class FamilyHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "color": user_input.get(_MEMBER_COLOR_FIELD) or "",
                 "includeInChores": bool(user_input.get(_MEMBER_INCLUDE_FIELD, True)),
             }
+            member_calendar = user_input.get(_MEMBER_CALENDAR_FIELD)
+            if isinstance(member_calendar, str) and member_calendar.startswith("calendar."):
+                self._member_profiles[user_id]["primaryCalendar"] = member_calendar
             self._member_setup_queue.pop(0)
 
         if not self._member_setup_queue:
@@ -571,15 +583,31 @@ class FamilyHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(step_id="chores_features", data_schema=_build_chores_features_schema())
 
     async def async_step_calendars(self, user_input: dict[str, Any] | None = None):
-        """Pick which calendar.* entities Family Hub should watch for
-        event reminders - the same "Calendars to monitor" list Configure's
-        Calendar reminders step edits later, just asked up front so a fresh
-        install doesn't silently have reminders off. Leaving this empty is
-        fine; it can be filled in from Configure or by adding notify
-        devices to a calendar in the card's own Settings (which adds it to
-        this list automatically)."""
+        """Pick which calendars go on the family calendar.
+
+        v1.168.60 (calendar UX review): this step used to ask only for
+        "Calendars to monitor" (reminder polling), so a household that
+        filled it in still landed on an empty calendar card. Now the picks
+        here ARE the calendar's columns: each one that isn't already a
+        member's own calendar (picked on that member's own screen) is
+        seeded as a Settings > Calendars row by
+        _maybe_seed_calendar_rows_from_setup_wizard. Every picked calendar,
+        plus every member's own calendar, also goes into CONF_CALENDARS
+        ("Calendars to monitor") exactly as this step always did, so
+        reminders work out of the box. Leaving it empty is still fine."""
         if user_input is not None:
-            self._collected_options[CONF_CALENDARS] = user_input.get(CONF_CALENDARS, [])
+            picked = [e for e in (user_input.get(CONF_CALENDARS) or []) if isinstance(e, str) and e]
+            member_calendars = [
+                p.get("primaryCalendar")
+                for p in (self._collected_options.get(CONF_INITIAL_USER_PROFILES) or {}).values()
+                if isinstance(p, dict) and p.get("primaryCalendar")
+            ]
+            monitored: list[str] = []
+            for entity in member_calendars + picked:
+                if entity not in monitored:
+                    monitored.append(entity)
+            self._collected_options[CONF_CALENDARS] = monitored
+            self._collected_options[CONF_INITIAL_CALENDARS] = [e for e in picked if e not in member_calendars]
             return await self.async_step_grocy()
 
         return self.async_show_form(
@@ -802,11 +830,12 @@ def _write_backup_export_file(hass: HomeAssistant, snapshot: dict[str, Any]) -> 
     under <config>/family_hub_backups/exports/, named after the snapshot's
     own original timestamp so two exports of the same snapshot overwrite
     each other instead of piling up. Returns the full path written, for
-    display in the confirmation screen - Home Assistant's config flow has
-    no way to push a browser download itself, so "here's the path, go get
-    it" (Samba, SSH, the Studio Code Server/Terminal add-ons, etc.) is the
-    only honest option. Blocking (file I/O) - always call this via
-    hass.async_add_executor_job, never awaited directly from a flow step.
+    display in the confirmation screen - kept as a second way to grab the
+    file (Samba, SSH, the Studio Code Server/Terminal add-ons, etc.)
+    alongside the real browser download link async_step_export_backup
+    also generates via FamilyHubSettingsHistoryExportView. Blocking (file
+    I/O) - always call this via hass.async_add_executor_job, never
+    awaited directly from a flow step.
     """
     export_dir = Path(hass.config.path(SETTINGS_BACKUP_DIR_NAME, "exports"))
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -1076,15 +1105,13 @@ class FamilyHubOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(step_id="restore_backup_pick", data_schema=schema)
 
     async def async_step_export_backup(self, user_input: dict[str, Any] | None = None):
-        """Pick one of the existing Settings-history snapshots and write
-        it out as a standalone .json file under
-        <config>/family_hub_backups/exports/ - the file to hand off for
-        safekeeping outside this install entirely, or to later feed back
-        in on this or another install via async_step_import_backup. Home
-        Assistant's config flow has no way to trigger a browser download
-        directly, so the confirmation screen just names the path; use
-        Samba, SSH, or the Studio Code Server/Terminal add-ons to actually
-        grab the file from there."""
+        """Pick one of the existing Settings-history snapshots and make it
+        available two ways: written out as a standalone .json file under
+        <config>/family_hub_backups/exports/ (for Samba/SSH/a Terminal
+        add-on), AND as a real browser download - a short-lived signed URL
+        to FamilyHubSettingsHistoryExportView (__init__.py), shown as a
+        clickable link on the confirmation screen. Either one can later be
+        fed back in on this or another install via async_step_import_backup."""
         entry_data = _get_family_hub_entry_data(self.hass)
         if entry_data is None:
             return self.async_abort(reason="not_found")
@@ -1101,11 +1128,40 @@ class FamilyHubOptionsFlow(config_entries.OptionsFlow):
                 return self.async_abort(reason="no_backups")
             snapshot = snapshots[index]
             path = await self.hass.async_add_executor_job(_write_backup_export_file, self.hass, snapshot)
+            # Household ask, verbatim: "allow backups to be downloaded and
+            # uploaded as well" - uploading already worked (the import
+            # step below is a real browser file-upload control), this is
+            # the download half. Sign a short-lived URL to
+            # FamilyHubSettingsHistoryExportView (__init__.py) the same
+            # way Home Assistant signs its own camera/image URLs, so
+            # clicking it in the confirmation screen downloads the file
+            # straight from the admin's own browser - no separate login,
+            # and the link stops working on its own after 5 minutes
+            # rather than staying valid forever. The server-side copy in
+            # family_hub_backups/exports/ (path, above) is kept too, for
+            # anyone who'd rather grab it via Samba/SSH/a Terminal add-on.
+            download_url = async_sign_path(
+                self.hass,
+                f"/api/family_hub/settings_history_export/{self.config_entry.entry_id}/{index}",
+                timedelta(minutes=5),
+            )
             return self.async_abort(
                 reason="export_done",
                 description_placeholders={
                     "when": _describe_settings_history_snapshot(snapshot, now),
                     "path": path,
+                    # v1.168.84: a plain Markdown link to this same-origin
+                    # URL never downloaded anything - Home Assistant's
+                    # frontend treats a click on any same-origin link
+                    # without a target/download attribute as in-app
+                    # navigation (is-navigation-click.ts) and just routed
+                    # to a blank page. target="_blank" (kept by HA's
+                    # Markdown sanitizer) hands the click to the browser,
+                    # which opens the signed URL and saves the file, since
+                    # FamilyHubSettingsHistoryExportView answers with
+                    # Content-Disposition: attachment - the same way HA's
+                    # own backup downloads work.
+                    "download_link": f'<a href="{download_url}" target="_blank" rel="noopener">⬇️ Download the backup file</a>',
                 },
             )
 

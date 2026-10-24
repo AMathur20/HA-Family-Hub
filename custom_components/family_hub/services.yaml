@@ -137,3 +137,105 @@ nudge_user:
       required: true
       selector:
         text:
+start_timer:
+  name: Start a timer
+  description: >-
+    Start a Family Hub timer (the same kind as the Active Timers card's
+    quick timer). When it ends it rings on the screens, phones and speakers
+    it should, until someone taps Stop.
+  fields:
+    label:
+      name: Label
+      description: What the timer is for.
+      required: false
+      example: Pizza
+      selector:
+        text:
+    hours:
+      name: Hours
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 24
+          mode: box
+    minutes:
+      name: Minutes
+      required: false
+      example: 12
+      selector:
+        number:
+          min: 0
+          max: 1440
+          mode: box
+    seconds:
+      name: Seconds
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 59
+          mode: box
+    user:
+      name: For
+      description: A Home Assistant user id or a person's name. Leave empty for a house timer.
+      required: false
+      selector:
+        text:
+    alarm_audience:
+      name: Who hears the alarm
+      description: >-
+        self - that person's screens, phones and linked speakers (or, for a
+        house timer, the house speakers); kiosks - also the kiosk screens and
+        house speakers; everyone - every screen, phone and speaker.
+      required: false
+      default: self
+      selector:
+        select:
+          options:
+            - self
+            - kiosks
+            - everyone
+    speakers:
+      name: Speakers
+      description: Ring on just these registered alarm speakers instead.
+      required: false
+      selector:
+        entity:
+          multiple: true
+          domain:
+            - media_player
+            - assist_satellite
+cancel_timer:
+  name: Cancel a timer
+  description: >-
+    Stop running Family Hub timer(s) without them going off - by id, or
+    every timer for a person and/or with a label.
+  fields:
+    uid:
+      name: Timer id
+      required: false
+      selector:
+        text:
+    user:
+      name: For
+      description: A Home Assistant user id or a person's name.
+      required: false
+      selector:
+        text:
+    label:
+      name: Label
+      required: false
+      selector:
+        text:
+stop_timer_alarm:
+  name: Stop a ringing timer alarm
+  description: >-
+    Silence a ringing Family Hub timer alarm everywhere (screens, phones,
+    speakers). Without an id, stops every ringing alarm.
+  fields:
+    uid:
+      name: Timer id
+      required: false
+      selector:
+        text:

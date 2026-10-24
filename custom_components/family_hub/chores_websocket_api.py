@@ -40,21 +40,29 @@ _require_permission below.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import voluptuous as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.util import dt as dt_util
 
 from . import chore_engine, goal_engine, privacy_mode_shared, reward_engine, routine_engine, routine_library, sensor as timer_sensor, store as chores_store, switch as device_settings_switch, timer_engine
 from .const import (
+    ALARM_AUTO_STOP_SECONDS,
     ALARM_REANNOUNCE_SECONDS,
+    ALARM_STOP_ACTION_PREFIX,
+    EVENT_FAMILY_HUB_TIMER_ALARM_STOPPED,
+    EVENT_FAMILY_HUB_TIMER_CANCELLED,
+    EVENT_FAMILY_HUB_TIMER_STARTED,
+    TIMER_LOG_MAX_ENTRIES,
     CHORE_KEY_ALARM_AUDIENCE,
     CHORE_KEY_GROUP_ID,
     CHORE_KEY_IMPORTANT,
@@ -159,7 +167,9 @@ async def _user_display_name(hass: HomeAssistant, user_id: Optional[str]) -> str
     return (match.name or match.id) if match else user_id
 
 
-async def _send_instant_notification(hass: HomeAssistant, notify_targets: list[str], title: str, message: str) -> int:
+async def _send_instant_notification(
+    hass: HomeAssistant, notify_targets: list[str], title: str, message: str, extra: Optional[dict] = None
+) -> int:
     """Best-effort push to every resolved notify target - shared send loop
     for the two v123+ instant profile notifications (notifyRewardClaimed/
     notifyChoreApproved, see const.py's SETTINGS_KEY_USER_PROFILES
@@ -171,7 +181,9 @@ async def _send_instant_notification(hass: HomeAssistant, notify_targets: list[s
     Daily Digest send loop's best-effort try/except-per-target. Returns how
     many sends succeeded."""
     entry = _get_entry(hass)
-    data = _notification_click_data(entry)
+    data = dict(_notification_click_data(entry))
+    if extra:
+        data.update(extra)
     sent = 0
     for target in notify_targets:
         split = _split_notify_target(target)
@@ -188,7 +200,9 @@ async def _send_instant_notification(hass: HomeAssistant, notify_targets: list[s
     return sent
 
 
-async def _send_alarm_notification(hass: HomeAssistant, notify_targets: list[str], title: str, message: str) -> int:
+async def _send_alarm_notification(
+    hass: HomeAssistant, notify_targets: list[str], title: str, message: str, extra: Optional[dict] = None
+) -> int:
     """same send loop as _send_instant_notification, but with an
     enriched `data` payload asking the Home Assistant Companion App for
     alarm-like delivery instead of a normal quiet push - only used for a
@@ -238,6 +252,8 @@ async def _send_alarm_notification(hass: HomeAssistant, notify_targets: list[str
             "interruption-level": "critical",
         },
     })
+    if extra:
+        data.update(extra)
     sent = 0
     for target in notify_targets:
         split = _split_notify_target(target)
@@ -350,7 +366,358 @@ def _prune_kiosk_elevations(entry_data: dict[str, Any]) -> None:
 
 
 def _hash_pin(pin: str, salt: str) -> str:
+    """The original (pre-v1.168.71) one-round salted SHA-256. Kept only to
+    verify a PIN set before v1.168.71 - see _verify_pin_record, which
+    upgrades it to PBKDF2 the first time that PIN is used."""
     return hashlib.sha256(f"{salt}:{pin}".encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# v1.168.71: kiosk PIN storage (fixes the v1.168.59 review's issue #2)
+#
+# PIN hashes used to live in settings["userProfiles"][uid]["pinHash"/
+# "pinSalt"] - the same blob family_hub/get_settings returns to ANY
+# connection and family_hub/set_settings accepts from any connection, so a
+# PIN hash could be read (and a 4-8 digit PIN brute-forced offline in well
+# under a second) or planted by any logged-in account, and nothing limited
+# guesses. Now:
+#   - hashes live in their own Store (entry_data["pins_store"], key
+#     family_hub_kiosk_pins_<entry_id>) that nothing but this section reads
+#     or writes; get_settings strips them and set_settings refuses them
+#   - PBKDF2-HMAC-SHA256 (PIN_PBKDF2_ITERATIONS rounds) instead of one
+#     SHA-256 round; a legacy hash still verifies once and is upgraded
+#   - 5 wrong PINs for one person lock that person's PIN for 5 minutes,
+#     for every PIN check (kiosk login, Privacy Mode unlock, locked pop-ups)
+#   - any pinHash/pinSalt found in the settings blob (an older install, or
+#     a settings backup restored later) is moved here and stripped
+# ---------------------------------------------------------------------------
+PIN_PBKDF2_ITERATIONS = 120_000
+PIN_MAX_FAILURES = 5
+PIN_LOCKOUT_SECONDS = 300
+
+
+class _MemoryStore:
+    """Stand-in used only when entry_data has no real Store for this (the
+    integration always creates one - see async_setup_entry; this keeps
+    hand-built test entry_data working)."""
+
+    def __init__(self) -> None:
+        self._data = None
+
+    async def async_load(self):
+        return self._data
+
+    async def async_save(self, data) -> None:
+        self._data = data
+
+
+def _pins_store(hass: HomeAssistant, entry_data: dict[str, Any]):
+    store = entry_data.get("pins_store")
+    if store is None:
+        store = _MemoryStore()
+        entry_data["pins_store"] = store
+    return store
+
+
+def _strip_pins_from_settings(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Removes pinHash/pinSalt from every profile in a settings dict (in
+    place) and returns what was removed, keyed by user id."""
+    found: dict[str, dict[str, str]] = {}
+    profiles = settings.get("userProfiles") if isinstance(settings, dict) else None
+    if not isinstance(profiles, dict):
+        return found
+    for uid, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        h = profile.pop("pinHash", None)
+        salt = profile.pop("pinSalt", None)
+        if h and salt:
+            found[uid] = {"algo": "sha256", "salt": salt, "hash": h}
+    return found
+
+
+async def async_load_pins(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """{user_id: {algo, salt, hash, [iterations]}} - migrating any hash
+    still sitting in the settings blob into the private store first."""
+    pins = entry_data.get("kiosk_pins")
+    if pins is None:
+        pins = await _pins_store(hass, entry_data).async_load() or {}
+        entry_data["kiosk_pins"] = pins
+    settings_store = entry_data.get("settings_store")
+    if settings_store is not None and not entry_data.get("kiosk_pins_migrated"):
+        # set_settings strips hashes from every incoming save, so after one
+        # check per run the blob can't hold any again
+        entry_data["kiosk_pins_migrated"] = True
+        settings = await settings_store.async_load() or {}
+        found = _strip_pins_from_settings(settings)
+        if found:
+            for uid, rec in found.items():
+                pins.setdefault(uid, rec)  # a PIN already in the private store wins
+            await _pins_store(hass, entry_data).async_save(pins)
+            await settings_store.async_save(settings)
+            _LOGGER.info("Family Hub: moved %s kiosk PIN(s) out of the shared settings", len(found))
+    return pins
+
+
+def _pbkdf2(pin: str, salt: str, iterations: int) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
+
+
+async def async_set_pin(hass: HomeAssistant, entry_data: dict[str, Any], user_id: str, pin: Optional[str]) -> None:
+    pins = await async_load_pins(hass, entry_data)
+    if pin:
+        salt = secrets.token_hex(16)
+        digest = await hass.async_add_executor_job(_pbkdf2, pin, salt, PIN_PBKDF2_ITERATIONS)
+        pins[user_id] = {"algo": "pbkdf2_sha256", "iterations": PIN_PBKDF2_ITERATIONS, "salt": salt, "hash": digest}
+    else:
+        pins.pop(user_id, None)
+    entry_data.setdefault("pin_failures", {}).pop(user_id, None)
+    await _pins_store(hass, entry_data).async_save(pins)
+
+
+async def async_has_pin(hass: HomeAssistant, entry_data: dict[str, Any], user_id: str) -> bool:
+    return bool((await async_load_pins(hass, entry_data)).get(user_id))
+
+
+def pin_lockout_remaining(entry_data: dict[str, Any], user_id: str) -> int:
+    rec = entry_data.setdefault("pin_failures", {}).get(user_id)
+    if not rec:
+        return 0
+    return max(0, int(rec.get("locked_until", 0) - time.time()))
+
+
+async def async_verify_pin(hass: HomeAssistant, entry_data: dict[str, Any], user_id: str, pin: str) -> str:
+    """"ok", "incorrect" or "locked". Every PIN check goes through here, so
+    the lockout applies everywhere. A wrong PIN for someone with no PIN set
+    still counts, so the answer never reveals who has a PIN."""
+    failures = entry_data.setdefault("pin_failures", {})
+    if pin_lockout_remaining(entry_data, user_id) > 0:
+        return "locked"
+    pins = await async_load_pins(hass, entry_data)
+    rec = pins.get(user_id) or {}
+    ok = False
+    pin = str(pin or "")
+    if rec.get("algo") == "pbkdf2_sha256" and rec.get("salt") and rec.get("hash"):
+        digest = await hass.async_add_executor_job(_pbkdf2, pin, rec["salt"], int(rec.get("iterations") or PIN_PBKDF2_ITERATIONS))
+        ok = hmac.compare_digest(digest, rec["hash"])
+    elif rec.get("salt") and rec.get("hash"):
+        ok = hmac.compare_digest(_hash_pin(pin, rec["salt"]), rec["hash"])
+        if ok:
+            await async_set_pin(hass, entry_data, user_id, pin)  # upgrade the old hash
+    if ok:
+        failures.pop(user_id, None)
+        return "ok"
+    entry = failures.setdefault(user_id, {"count": 0, "locked_until": 0})
+    entry["count"] += 1
+    if entry["count"] >= PIN_MAX_FAILURES:
+        entry["count"] = 0
+        entry["locked_until"] = time.time() + PIN_LOCKOUT_SECONDS
+        _LOGGER.warning("Family Hub: too many wrong PINs for a household member - PIN locked for %s minutes", PIN_LOCKOUT_SECONDS // 60)
+    return "incorrect"
+
+
+def _send_pin_error(connection: websocket_api.ActiveConnection, msg_id: int, result: str, entry_data: dict[str, Any], user_id: str) -> None:
+    if result == "locked":
+        connection.send_error(msg_id, "pin_locked", f"Too many wrong PINs - try again in {max(1, (pin_lockout_remaining(entry_data, user_id) + 59) // 60)} minute(s).")
+    else:
+        connection.send_error(msg_id, "incorrect_pin", "Incorrect PIN.")
+
+
+# ---------------------------------------------------------------------------
+# v1.168.71: locked More-menu pop-ups. A custom More-menu button can be
+# "locked" to a list of people (emergency contacts, addresses, the
+# babysitter sheet). Its content then never goes into the settings blob -
+# which every login can read - but into its own store, handed out only by
+# family_hub/more_menu/unlock: straight away to an allowed person on their
+# own (non-kiosk) login, otherwise only after that person's PIN.
+# ---------------------------------------------------------------------------
+LOCKED_POPUP_CONTENT_KEYS = ("heading", "text", "images", "qrLink", "qrType", "qrFields", "linkUrl", "linkLabel")
+
+
+def _locked_popups_store(entry_data: dict[str, Any]):
+    store = entry_data.get("locked_popups_store")
+    if store is None:
+        store = _MemoryStore()
+        entry_data["locked_popups_store"] = store
+    return store
+
+
+async def async_load_locked_popups(entry_data: dict[str, Any]) -> dict[str, Any]:
+    data = entry_data.get("locked_popups")
+    if data is None:
+        data = await _locked_popups_store(entry_data).async_load() or {}
+        entry_data["locked_popups"] = data
+    return data
+
+
+def _clean_locked_content(raw: Any) -> dict[str, Any]:
+    """Shapes/limits what's stored - the card normalizes it again before
+    drawing anything."""
+    raw = raw if isinstance(raw, dict) else {}
+
+    def s(key: str, limit: int) -> str:
+        v = raw.get(key)
+        return v[:limit] if isinstance(v, str) else ""
+
+    images = [u[:500] for u in (raw.get("images") or []) if isinstance(u, str) and u][:2] if isinstance(raw.get("images"), list) else []
+    fields = raw.get("qrFields") if isinstance(raw.get("qrFields"), dict) else {}
+    qr_fields = {str(k)[:20]: v[:800] for k, v in list(fields.items())[:10] if isinstance(v, str)}
+    link = s("linkUrl", 1000)
+    return {
+        "heading": s("heading", 80),
+        "text": s("text", 3000),
+        "images": images,
+        "qrLink": s("qrLink", 1000),
+        "qrType": s("qrType", 20),
+        "qrFields": qr_fields,
+        "linkUrl": link if link.lower().startswith(("http://", "https://")) else "",
+        "linkLabel": s("linkLabel", 40),
+    }
+
+
+def _locked_items(settings: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mm = settings.get("moreMenu") if isinstance(settings, dict) else None
+    custom = mm.get("custom") if isinstance(mm, dict) else None
+    out: dict[str, dict[str, Any]] = {}
+    for item in custom if isinstance(custom, list) else []:
+        if isinstance(item, dict) and item.get("locked") and isinstance(item.get("id"), str):
+            out[item["id"]] = item
+    return out
+
+
+def strip_locked_popup_content(settings: dict[str, Any]) -> None:
+    """For set_settings: copies moreMenu (the caller's payload is left
+    alone) and drops any content from locked items, so a secret can never
+    end up in the readable blob even if a client sends it."""
+    mm = settings.get("moreMenu") if isinstance(settings, dict) else None
+    if not isinstance(mm, dict) or not isinstance(mm.get("custom"), list):
+        return
+    mm = dict(mm)
+    custom = []
+    for item in mm["custom"]:
+        if isinstance(item, dict) and item.get("locked"):
+            item = {k: v for k, v in item.items() if k not in LOCKED_POPUP_CONTENT_KEYS}
+            ids = item.get("unlockUserIds")
+            item["unlockUserIds"] = [u for u in ids if isinstance(u, str) and u][:30] if isinstance(ids, list) else []
+        custom.append(item)
+    mm["custom"] = custom
+    settings["moreMenu"] = mm
+
+
+async def async_prune_locked_popups(entry_data: dict[str, Any], settings: dict[str, Any]) -> None:
+    """Content for a button that's gone, or no longer locked, is deleted."""
+    data = await async_load_locked_popups(entry_data)
+    keep = set(_locked_items(settings))
+    stale = [k for k in data if k not in keep]
+    if stale:
+        for k in stale:
+            data.pop(k, None)
+        await _locked_popups_store(entry_data).async_save(data)
+
+
+async def _connection_profile(entry_data: dict[str, Any], user_id: Optional[str]) -> dict[str, Any]:
+    settings = await _load_settings(entry_data)
+    profiles = settings.get("userProfiles") if isinstance(settings.get("userProfiles"), dict) else {}
+    prof = profiles.get(user_id) if user_id else None
+    return prof if isinstance(prof, dict) else {}
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "family_hub/more_menu/locked/set", vol.Required("item_id"): str, vol.Required("content"): vol.Any(dict, None)}
+)
+@websocket_api.async_response
+async def ws_more_menu_locked_set(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Admin-only. The button must already be saved as locked (the card
+    saves settings first, then this)."""
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    if not (connection.user and connection.user.is_admin):
+        connection.send_error(msg["id"], "forbidden", "Only an admin can change a locked pop-up.")
+        return
+    settings = await _load_settings(entry_data)
+    if msg["item_id"] not in _locked_items(settings):
+        connection.send_error(msg["id"], "not_found", "That button isn't saved as locked.")
+        return
+    data = await async_load_locked_popups(entry_data)
+    if msg["content"] is None:
+        data.pop(msg["item_id"], None)
+    else:
+        data[msg["item_id"]] = _clean_locked_content(msg["content"])
+    await _locked_popups_store(entry_data).async_save(data)
+    connection.send_result(msg["id"], {"success": True})
+
+
+@websocket_api.websocket_command({vol.Required("type"): "family_hub/more_menu/locked/get_for_edit", vol.Required("item_id"): str})
+@websocket_api.async_response
+async def ws_more_menu_locked_get_for_edit(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    if not (connection.user and connection.user.is_admin):
+        connection.send_error(msg["id"], "forbidden", "Only an admin can edit a locked pop-up.")
+        return
+    data = await async_load_locked_popups(entry_data)
+    connection.send_result(msg["id"], {"content": data.get(msg["item_id"]) or _clean_locked_content({})})
+
+
+@websocket_api.websocket_command({vol.Required("type"): "family_hub/more_menu/unlock_options", vol.Required("item_id"): str})
+@websocket_api.async_response
+async def ws_more_menu_unlock_options(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """direct: this login may open it with no PIN. users: who can unlock it
+    with a PIN (name + has_pin only)."""
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    settings = await _load_settings(entry_data)
+    item = _locked_items(settings).get(msg["item_id"])
+    if item is None:
+        connection.send_error(msg["id"], "not_found", "That pop-up isn't locked.")
+        return
+    allowed = item.get("unlockUserIds") or []
+    me = connection.user.id if connection.user else None
+    prof = await _connection_profile(entry_data, me)
+    direct = bool(me and me in allowed and not prof.get("isKioskAccount"))
+    pins = await async_load_pins(hass, entry_data)
+    users = [{"id": uid, "name": await _user_display_name(hass, uid), "has_pin": bool(pins.get(uid))} for uid in allowed]
+    connection.send_result(msg["id"], {"direct": direct, "users": users})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "family_hub/more_menu/unlock",
+        vol.Required("item_id"): str,
+        vol.Optional("user_id"): str,
+        vol.Optional("pin"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_more_menu_unlock(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Returns a locked pop-up's content. Same single "incorrect_pin" error
+    for a wrong PIN, no PIN set, or a person not on the list."""
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    settings = await _load_settings(entry_data)
+    item = _locked_items(settings).get(msg["item_id"])
+    if item is None:
+        connection.send_error(msg["id"], "not_found", "That pop-up isn't locked.")
+        return
+    allowed = item.get("unlockUserIds") or []
+    me = connection.user.id if connection.user else None
+    prof = await _connection_profile(entry_data, me)
+    if not (me and me in allowed and not prof.get("isKioskAccount")):
+        uid = msg.get("user_id") or ""
+        pin = msg.get("pin") or ""
+        if not uid or not pin:
+            connection.send_error(msg["id"], "pin_required", "A PIN is needed to open this.")
+            return
+        result = await async_verify_pin(hass, entry_data, uid, pin)
+        if result != "ok" or uid not in allowed:
+            _send_pin_error(connection, msg["id"], result if result != "ok" else "incorrect", entry_data, uid)
+            return
+    data = await async_load_locked_popups(entry_data)
+    connection.send_result(msg["id"], {"content": data.get(msg["item_id"]) or _clean_locked_content({})})
 
 
 async def _ha_user_is_admin(hass: HomeAssistant, user_id: Optional[str]) -> bool:
@@ -816,6 +1183,45 @@ async def ws_claim_chore(hass: HomeAssistant, connection: websocket_api.ActiveCo
         return
     try:
         chore = chore_engine.claim_chore(entry_data["chores"], hass, msg["chore_id"], user_id, await _make_is_chores_eligible(entry_data))
+    except chore_engine.ChoreError as err:
+        connection.send_error(msg["id"], err.code, str(err))
+        return
+    await _save_chores(hass, entry_data)
+    connection.send_result(msg["id"], {"chore": chore})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "family_hub/chores/set_in_progress",
+        vol.Required("chore_id"): str,
+        vol.Required("in_progress"): bool,
+        vol.Optional("elevation_token"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_chore_in_progress(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Household ask, verbatim: "Chores should have a button to Mark in
+    progress also." Same self-serve gate as ws_complete_chore/
+    ws_start_chore_timer: the chore's own assignee can toggle this on
+    themselves, and so can anyone with verify or can_complete_any
+    (an admin, or a shared wall-tablet login marking it on someone else's
+    behalf). This never changes status/approval/stars - see
+    chore_engine.set_chore_in_progress's own docstring for why it's a
+    plain reversible flag, not a new state-machine step."""
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    chore = entry_data["chores"].get(msg["chore_id"])
+    user_id, is_admin = await _effective_actor(hass, connection, entry_data, msg)
+    is_assignee = chore is not None and chore.get("assigned_to") == user_id
+    can_toggle_for_others = _has_permission_ctx(entry_data, user_id, is_admin, PERMISSION_VERIFY) or _has_permission_ctx(
+        entry_data, user_id, is_admin, PERMISSION_COMPLETE_ANY
+    )
+    if not is_assignee and not can_toggle_for_others:
+        connection.send_error(msg["id"], "forbidden", "Only the person this chore is assigned to (or an admin/verifier/can_complete_any grant) can mark it in progress.")
+        return
+    try:
+        chore = chore_engine.set_chore_in_progress(entry_data["chores"], hass, msg["chore_id"], user_id, msg["in_progress"])
     except chore_engine.ChoreError as err:
         connection.send_error(msg["id"], err.code, str(err))
         return
@@ -1653,6 +2059,15 @@ async def ws_get_my_permissions(hass: HomeAssistant, connection: websocket_api.A
         # permissions (still False) and immediately reverted - it looked
         # like the checkbox couldn't be checked at all.
         vol.Optional("can_delete_event"): bool,
+        # PERMISSION_EDIT_EVENT - same trap, missed when can_delete_event
+        # was added right above it. Household report, verbatim: "the
+        # permissions edit/move calendar events wont check" - exactly the
+        # v1.133.2 symptom again (checkbox ticks, then reverts, because the
+        # key never reached ws_set_permissions for voluptuous to pass
+        # through - see that fix's own comment above for the full
+        # mechanism). CHORE_PERMISSIONS already had it since it was
+        # introduced, so the checkbox itself was never the problem.
+        vol.Optional("can_edit_event"): bool,
         vol.Optional("can_manage_own_routines"): bool,
         vol.Optional("can_manage_any_routines"): bool,
         # PERMISSION_TOGGLE_PRIVACY_MODE - see its own docstring in
@@ -1697,6 +2112,10 @@ async def ws_set_permissions(hass: HomeAssistant, connection: websocket_api.Acti
 # is_admin) pair, and note the permission decision is always re-derived
 # server-side from that pair, never trusted from the client.
 #
+# FIXED in v1.168.71 (was the v1.168.59 review's open issue #2): PIN
+# hashes no longer live in the shared settings blob - see the "kiosk PIN
+# storage" section near _hash_pin (private store, PBKDF2, lockout).
+#
 # PIN storage/verification is deliberately NOT routed through the general
 # family_hub/get_settings / family_hub/set_settings pair - that pair does
 # an ungated full blob replace (see __init__.py's own _ws_set_settings
@@ -1733,8 +2152,9 @@ async def ws_kiosk_list_login_users(hass: HomeAssistant, connection: websocket_a
     except Exception:  # noqa: BLE001
         ha_users = []
     names = {u.id: (u.name or u.id) for u in ha_users}
+    pins = await async_load_pins(hass, entry_data)
     users = [
-        {"id": uid, "name": names.get(uid, uid), "has_pin": bool((profiles.get(uid) or {}).get("pinHash"))}
+        {"id": uid, "name": names.get(uid, uid), "has_pin": bool(pins.get(uid))}
         for uid in enabled_ids
         if uid in names
     ]
@@ -1759,22 +2179,10 @@ async def ws_kiosk_set_pin(hass: HomeAssistant, connection: websocket_api.Active
     if pin and (not pin.isdigit() or not (4 <= len(pin) <= 8)):
         connection.send_error(msg["id"], "invalid_pin", "PIN must be 4-8 digits.")
         return
-    store = entry_data.get("settings_store")
-    if store is None:
+    if entry_data.get("settings_store") is None:
         connection.send_error(msg["id"], "not_found", "Family Hub is not set up")
         return
-    settings = await store.async_load() or {}
-    profiles = settings.setdefault("userProfiles", {})
-    profile = dict(profiles.get(msg["user_id"]) or {})
-    if pin:
-        salt = secrets.token_hex(16)
-        profile["pinSalt"] = salt
-        profile["pinHash"] = _hash_pin(pin, salt)
-    else:
-        profile.pop("pinSalt", None)
-        profile.pop("pinHash", None)
-    profiles[msg["user_id"]] = profile
-    await store.async_save(settings)
+    await async_set_pin(hass, entry_data, msg["user_id"], pin or None)
     connection.send_result(msg["id"], {"has_pin": bool(pin)})
 
 
@@ -1795,16 +2203,9 @@ async def ws_kiosk_elevate(hass: HomeAssistant, connection: websocket_api.Active
         return
     settings = await _load_settings(entry_data)
     enabled_ids = settings.get("kioskLoginEnabledUserIds") or []
-    profile = (settings.get("userProfiles") or {}).get(msg["user_id"]) or {}
-    salt = profile.get("pinSalt")
-    stored_hash = profile.get("pinHash")
-    if (
-        msg["user_id"] not in enabled_ids
-        or not salt
-        or not stored_hash
-        or _hash_pin(msg["pin"], salt) != stored_hash
-    ):
-        connection.send_error(msg["id"], "incorrect_pin", "Incorrect PIN.")
+    result = await async_verify_pin(hass, entry_data, msg["user_id"], msg["pin"])
+    if result != "ok" or msg["user_id"] not in enabled_ids:
+        _send_pin_error(connection, msg["id"], result if result != "ok" else "incorrect", entry_data, msg["user_id"])
         return
     _prune_kiosk_elevations(entry_data)
     token = secrets.token_hex(16)
@@ -2684,6 +3085,182 @@ async def _release_native_timer(hass: HomeAssistant, timer: dict[str, Any], *, c
         _LOGGER.debug("Family Hub: could not cancel native timer %s: %s", entity_id, err)
 
 
+# ---------------------------------------------------------------------------
+# v1.168.74 timer + alarm overhaul: exact-second firing, the timer log, and
+# automation events. See also the alarm section further down.
+# ---------------------------------------------------------------------------
+TIMER_SOURCES = ("chores", "rewards", "timers", "calendar", "automation", "voice", "other")
+
+
+def _timer_unsubs(entry_data: dict[str, Any]) -> dict[str, Any]:
+    return entry_data.setdefault("timer_unsubs", {})
+
+
+def _unschedule_timer(entry_data: dict[str, Any], uid: Optional[str]) -> None:
+    unsub = _timer_unsubs(entry_data).pop(uid, None) if uid else None
+    if unsub is not None:
+        try:
+            unsub()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def schedule_timer(hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any]) -> None:
+    """Fire this timer on the exact second it ends (the 15-second sweep is
+    only the backstop now - a kitchen timer going off half a minute late
+    reads as broken). Also called for every stored timer at startup."""
+    uid = timer.get("uid")
+    end = timer_engine.ends_at(timer)
+    if not uid or end is None:
+        return
+    _unschedule_timer(entry_data, uid)
+
+    async def _due(_now=None) -> None:
+        _timer_unsubs(entry_data).pop(uid, None)
+        try:
+            fired = await _expire_due_timers(hass, entry_data)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Family Hub: timer %s failed to fire on time: %s", uid, err)
+            return
+        if fired:
+            todo_entity = entry_data.get("chores_todo_entity")
+            if todo_entity is not None:
+                try:
+                    todo_entity.async_write_ha_state()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    try:
+        _timer_unsubs(entry_data)[uid] = async_track_point_in_utc_time(hass, _due, end)
+    except Exception as err:  # noqa: BLE001 - the sweep still covers it
+        _LOGGER.debug("Family Hub: could not schedule timer %s exactly: %s", uid, err)
+
+
+def _timer_log(entry_data: dict[str, Any]) -> list[dict[str, Any]]:
+    log = entry_data.get("timer_log")
+    if not isinstance(log, list):
+        log = []
+        entry_data["timer_log"] = log
+    return log
+
+
+async def async_load_timer_log(entry_data: dict[str, Any]) -> list[dict[str, Any]]:
+    if not entry_data.get("timer_log_loaded"):
+        entry_data["timer_log_loaded"] = True
+        store = entry_data.get("timer_log_store")
+        loaded = (await store.async_load()) if store is not None else None
+        if isinstance(loaded, dict) and isinstance(loaded.get("entries"), list):
+            # anything logged in memory before the load finished stays on top
+            current = _timer_log(entry_data)
+            seen = {e.get("uid") for e in current}
+            current.extend(e for e in loaded["entries"] if isinstance(e, dict) and e.get("uid") not in seen)
+    return _timer_log(entry_data)
+
+
+async def _save_timer_log(entry_data: dict[str, Any]) -> None:
+    log = _timer_log(entry_data)
+    del log[TIMER_LOG_MAX_ENTRIES:]
+    store = entry_data.get("timer_log_store")
+    if store is not None:
+        try:
+            await store.async_save({"entries": log})
+        except Exception as err:  # noqa: BLE001 - the log must never break a timer
+            _LOGGER.debug("Family Hub: could not save the timer log: %s", err)
+
+
+async def _log_timer_update(entry_data: dict[str, Any], uid: Optional[str], fields: dict[str, Any]) -> None:
+    """Merge fields into the log entry for this timer (alarm fields merge
+    into its own "alarm" dict)."""
+    if not uid:
+        return
+    log = await async_load_timer_log(entry_data)
+    entry = next((e for e in log if e.get("uid") == uid), None)
+    if entry is None:
+        return
+    alarm = fields.pop("alarm", None)
+    entry.update(fields)
+    if isinstance(alarm, dict):
+        merged = dict(entry.get("alarm") or {})
+        merged.update(alarm)
+        entry["alarm"] = merged
+    await _save_timer_log(entry_data)
+
+
+async def _timer_event_payload(hass: HomeAssistant, timer: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    end = timer_engine.ends_at(timer)
+    payload = {
+        "uid": timer.get("uid"),
+        "kind": timer.get("kind"),
+        "chore_id": timer.get("chore_id"),
+        "reward_item_id": timer.get("item_id"),
+        "title": timer.get("title"),
+        "user_id": timer.get("user_id") or None,
+        "user_name": await _user_display_name(hass, timer.get("user_id")) if timer.get("user_id") else None,
+        "started_by": timer.get("started_by") or None,
+        "source": timer.get("source") or None,
+        "native_timer_entity_id": timer.get("entity_id"),
+        "started_at": timer.get("started_at"),
+        "duration_minutes": timer.get("duration_minutes"),
+        "ends_at": end.isoformat() if end else None,
+    }
+    payload.update(extra)
+    return payload
+
+
+async def _after_timer_started(
+    hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any], actor_id: Optional[str], source: Optional[str]
+) -> None:
+    """Everything that happens once a timer is running, whoever started it:
+    exact-second scheduling, the log entry and the started event."""
+    if actor_id and not timer.get("started_by"):
+        timer["started_by"] = actor_id
+    src = (source or "").strip().lower()
+    timer["source"] = src if src in TIMER_SOURCES else (src[:20] or "other")
+    schedule_timer(hass, entry_data, timer)
+    log = await async_load_timer_log(entry_data)
+    end = timer_engine.ends_at(timer)
+    log.insert(0, {
+        "uid": timer.get("uid"),
+        "kind": timer.get("kind"),
+        "title": timer.get("title") or "",
+        "user_id": timer.get("user_id") or None,
+        "user_name": await _user_display_name(hass, timer.get("user_id")) if timer.get("user_id") else None,
+        "started_by": timer.get("started_by") or None,
+        "started_by_name": await _user_display_name(hass, timer.get("started_by")) if timer.get("started_by") else None,
+        "source": timer.get("source"),
+        "chore_id": timer.get("chore_id"),
+        "item_id": timer.get("item_id"),
+        "duration_minutes": timer.get("duration_minutes"),
+        "audience": timer_engine.normalize_alarm_audience(timer.get("alarm_audience")),
+        "started_at": timer.get("started_at"),
+        "ends_at": end.isoformat() if end else None,
+        "outcome": "running",
+    })
+    await _save_timer_log(entry_data)
+    hass.bus.async_fire(EVENT_FAMILY_HUB_TIMER_STARTED, await _timer_event_payload(hass, timer))
+
+
+async def _after_timer_cancelled(
+    hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any], by_user_id: Optional[str], reason: str
+) -> None:
+    """A timer that stopped WITHOUT finishing - cancelled on a card, from
+    Home Assistant's own timer UI, by an automation, or because its chore
+    was finished by hand. An automation like "turn the internet back off
+    when computer time ends" should listen for this too."""
+    _unschedule_timer(entry_data, timer.get("uid"))
+    await _log_timer_update(entry_data, timer.get("uid"), {
+        "outcome": "cancelled",
+        "ended_at": dt_util.utcnow().isoformat(),
+        "cancel_reason": reason,
+        "cancelled_by": by_user_id,
+        "cancelled_by_name": await _user_display_name(hass, by_user_id) if by_user_id else None,
+    })
+    hass.bus.async_fire(
+        EVENT_FAMILY_HUB_TIMER_CANCELLED,
+        await _timer_event_payload(hass, timer, reason=reason, cancelled_by=by_user_id),
+    )
+
+
 async def _fire_timer(hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any]) -> None:
     """The one dispatcher both completion paths go through - HA's own
     timer.finished event (_handle_native_timer_event) and the backstop
@@ -2701,21 +3278,9 @@ async def _fire_timer(hass: HomeAssistant, entry_data: dict[str, Any], timer: di
     # (handle_native_timer_event / _expire_due_timers) - by the time either
     # calls this, the Store record is already gone, which is what "expired,
     # about to fire" means.
-    hass.bus.async_fire(
-        EVENT_FAMILY_HUB_TIMER_FINISHED,
-        {
-            "uid": timer.get("uid"),
-            "kind": timer.get("kind"),
-            "chore_id": timer.get("chore_id"),
-            "reward_item_id": timer.get("item_id"),
-            "title": timer.get("title"),
-            "user_id": timer.get("user_id"),
-            "user_name": await _user_display_name(hass, timer.get("user_id")) if timer.get("user_id") else None,
-            "native_timer_entity_id": timer.get("entity_id"),
-            "started_at": timer.get("started_at"),
-            "duration_minutes": timer.get("duration_minutes"),
-        },
-    )
+    _unschedule_timer(entry_data, timer.get("uid"))
+    hass.bus.async_fire(EVENT_FAMILY_HUB_TIMER_FINISHED, await _timer_event_payload(hass, timer, reason="finished"))
+    await _log_timer_update(entry_data, timer.get("uid"), {"outcome": "finished", "ended_at": dt_util.utcnow().isoformat()})
     kind = timer.get("kind")
     if kind == TIMER_KIND_CHORE:
         await _fire_chore_timer(hass, entry_data, timer)
@@ -2759,20 +3324,13 @@ async def handle_native_timer_event(hass: HomeAssistant, event: Any) -> None:
     timer_sensor.remove_timer_sensor(entry_data, timer.get("uid"))
     await _save_timers(hass, entry_data)
     if event.event_type != NATIVE_TIMER_EVENT_FINISHED:
+        ctx = getattr(event, "context", None)
+        await _after_timer_cancelled(hass, entry_data, timer, getattr(ctx, "user_id", None), "home_assistant")
         return
     try:
         await _fire_timer(hass, entry_data, timer)
     except Exception as err:  # noqa: BLE001 - one bad timer must not break the listener
         _LOGGER.warning("Family Hub: native timer %s failed to fire: %s", timer.get("uid"), err)
-
-
-def _get_entry_data(hass: HomeAssistant) -> Optional[dict[str, Any]]:
-    """Local copy of __init__.py's _get_family_hub_entry_data - see this
-    module's own docstring for why it isn't imported."""
-    entry = _get_entry(hass)
-    if entry is None:
-        return None
-    return hass.data.get(DOMAIN, {}).get("entries", {}).get(entry.entry_id)
 
 
 async def _clear_chore_timers(hass: HomeAssistant, entry_data: dict[str, Any], chore_id: str) -> None:
@@ -2786,6 +3344,7 @@ async def _clear_chore_timers(hass: HomeAssistant, entry_data: dict[str, Any], c
         await _save_timers(hass, entry_data)
         for timer in removed:
             await _release_native_timer(hass, timer, cancel=True)
+            await _after_timer_cancelled(hass, entry_data, timer, None, "chore_changed")
 
 
 async def _notify_targets_for_user(hass: HomeAssistant, entry_data: dict[str, Any], user_id: Optional[str]) -> list[str]:
@@ -2837,6 +3396,7 @@ async def ws_list_timers(hass: HomeAssistant, connection: websocket_api.ActiveCo
     {
         vol.Required("type"): "family_hub/timers/start_chore",
         vol.Required("chore_id"): str,
+        vol.Optional("source"): str,
         # this tab's own per-browser-tab id, echoed back onto the
         # timer as origin_client_id - see timer_engine.py's own docstring.
         vol.Optional("client_id"): str,
@@ -2900,6 +3460,7 @@ async def ws_start_chore_timer(hass: HomeAssistant, connection: websocket_api.Ac
         connection.send_error(msg["id"], err.code, str(err))
         return
     await _adopt_native_timer(hass, entry_data, timer)
+    await _after_timer_started(hass, entry_data, timer, user_id, msg.get("source") or "chores")
     timer_sensor.create_timer_sensor(hass, entry_data, timer, await _user_display_name(hass, owner))
     await _save_timers(hass, entry_data)
     connection.send_result(msg["id"], {"timer": timer})
@@ -2909,6 +3470,7 @@ async def ws_start_chore_timer(hass: HomeAssistant, connection: websocket_api.Ac
     {
         vol.Required("type"): "family_hub/timers/start_reward",
         vol.Required("item_id"): str,
+        vol.Optional("source"): str,
         vol.Optional("user_id"): str,
         vol.Optional("client_id"): str,
         vol.Optional("elevation_token"): str,
@@ -2981,6 +3543,7 @@ async def ws_start_reward_timer(hass: HomeAssistant, connection: websocket_api.A
         connection.send_error(msg["id"], err.code, str(err))
         return
     await _adopt_native_timer(hass, entry_data, timer)
+    await _after_timer_started(hass, entry_data, timer, actor_id, msg.get("source") or "rewards")
     timer_sensor.create_timer_sensor(hass, entry_data, timer, await _user_display_name(hass, target_user_id))
     await _save_rewards(hass, entry_data)
     await _save_timers(hass, entry_data)
@@ -3010,6 +3573,10 @@ async def ws_start_reward_timer(hass: HomeAssistant, connection: websocket_api.A
         vol.Optional("elevation_token"): str,
         # - see const.py's CHORE_KEY_ALARM_AUDIENCE.
         vol.Optional("alarm_audience"): vol.Any(str, None),
+        # v1.168.74: specific speakers for this one timer (alarm device ids
+        # or entity ids) instead of the people/house links in Settings
+        vol.Optional("alarm_device_ids"): [str],
+        vol.Optional("source"): str,
     }
 )
 @websocket_api.async_response
@@ -3037,42 +3604,67 @@ async def ws_start_standalone_timer(hass: HomeAssistant, connection: websocket_a
     if entry_data is None:
         return
     actor_id, _is_admin = await _effective_actor(hass, connection, entry_data, msg)
-    assigned_to = msg.get("user_id") or ""
-    label = timer_engine.normalize_timer_label(msg.get("label"))
     try:
-        timer = timer_engine.start_timer(
-            _timers_state(entry_data),
-            kind=TIMER_KIND_STANDALONE,
-            user_id=assigned_to,
-            duration_minutes=msg["duration_minutes"],
-            title=label,
-            # Only an assigned timer has someone specific to tell; an
-            # unassigned one falls back to the household at fire time (see
-            # _fire_standalone_timer).
-            notify_targets=await _notify_targets_for_user(hass, entry_data, assigned_to) if assigned_to else [],
-            alarm=await _timer_alarm_enabled_for_user(hass, entry_data, assigned_to) if assigned_to else False,
-            # unlike notify_targets/alarm just above, this one
-            # deliberately does NOT depend on whether the timer is assigned
-            # - an unassigned "house" timer (the oven, whose turn it is) can
-            # still widen to kiosks/everyone even though it has no owner to
-            # read a personal profile flag off of. See _dispatch_timer_alarm's
-            # own docstring for why this is intentionally decoupled from the
-            # "alarm" field right above it.
-            alarm_audience=timer_engine.normalize_alarm_audience(msg.get("alarm_audience")),
+        timer = await async_start_standalone_timer(
+            hass, entry_data,
+            minutes=msg["duration_minutes"],
+            label=msg.get("label"),
+            user_id=msg.get("user_id") or "",
+            actor_id=actor_id,
+            alarm_audience=msg.get("alarm_audience"),
+            alarm_device_ids=msg.get("alarm_device_ids"),
             client_id=msg.get("client_id"),
+            source=msg.get("source") or "timers",
         )
     except timer_engine.TimerError as err:
         connection.send_error(msg["id"], err.code, str(err))
         return
+    connection.send_result(msg["id"], {"timer": timer})
+
+
+async def async_start_standalone_timer(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    *,
+    minutes: Any,
+    label: Any = None,
+    user_id: str = "",
+    actor_id: Optional[str] = None,
+    alarm_audience: Any = None,
+    alarm_device_ids: Optional[list] = None,
+    client_id: Optional[str] = None,
+    source: str = "timers",
+) -> dict[str, Any]:
+    """Shared by the websocket command and the family_hub.start_timer
+    action. Raises timer_engine.TimerError."""
+    assigned_to = user_id or ""
+    label = timer_engine.normalize_timer_label(label)
+    timer = timer_engine.start_timer(
+        _timers_state(entry_data),
+        kind=TIMER_KIND_STANDALONE,
+        user_id=assigned_to,
+        duration_minutes=minutes,
+        title=label,
+        # Only an assigned timer has a person's own phones/profile; an
+        # unassigned one rings where it was started (see _resolve_alarm_reach).
+        notify_targets=await _notify_targets_for_user(hass, entry_data, assigned_to) if assigned_to else [],
+        alarm=await _timer_alarm_enabled_for_user(hass, entry_data, assigned_to) if assigned_to else False,
+        alarm_audience=timer_engine.normalize_alarm_audience(alarm_audience),
+        client_id=client_id,
+    )
     # Who started it, so an unassigned timer still has a recoverable owner
     # for the cancel rules (see ws_cancel_timer).
     timer["started_by"] = actor_id
+    ids = [str(d)[:200] for d in (alarm_device_ids or []) if isinstance(d, str) and d][:10]
+    if ids:
+        timer["alarm_device_ids"] = ids
     await _adopt_native_timer(hass, entry_data, timer)
+    await _after_timer_started(hass, entry_data, timer, actor_id, source)
     timer_sensor.create_timer_sensor(
         hass, entry_data, timer, await _user_display_name(hass, assigned_to) if assigned_to else None
     )
     await _save_timers(hass, entry_data)
-    connection.send_result(msg["id"], {"timer": timer})
+    return timer
 
 
 @websocket_api.websocket_command(
@@ -3144,6 +3736,7 @@ async def ws_cancel_timer(hass: HomeAssistant, connection: websocket_api.ActiveC
     # double-handle what we already cleared.
     if cancelled:
         await _release_native_timer(hass, cancelled, cancel=True)
+        await _after_timer_cancelled(hass, entry_data, cancelled, user_id, "cancelled")
     connection.send_result(msg["id"], {"cancelled": cancelled, "timers": timer_engine.list_timers(state)})
 
 
@@ -3170,6 +3763,7 @@ async def _expire_due_timers(hass: HomeAssistant, entry_data: dict[str, Any]) ->
     for timer in due:
         timer_engine.remove_timer(state, timer.get("uid"))
         timer_sensor.remove_timer_sensor(entry_data, timer.get("uid"))
+        _unschedule_timer(entry_data, timer.get("uid"))
     await _save_timers(hass, entry_data)
     for timer in due:
         try:
@@ -3191,109 +3785,57 @@ async def _fire_chore_timer(hass: HomeAssistant, entry_data: dict[str, Any], tim
     result is Awaiting Approval or an instant star payout is entirely
     chore_engine.complete_chore's call, off the chore's own
     no_approval_required flag and the completer's PERMISSION_AUTO_APPROVE
-    grant."""
+    grant. Then it rings (see _dispatch_timer_alarm)."""
     chore_id = timer.get("chore_id")
     chore = entry_data["chores"].get(chore_id) if chore_id else None
-    if chore is None:
-        # Deleted mid-countdown - nothing to complete, and the timer is
-        # already gone. Silence is the right outcome.
+    title = timer.get("title") or "your chore"
+    body = f"Time's up on \"{title}\"."
+    result = None
+    if chore is not None and chore.get("status") == chore_engine.CHORE_STATUS_OPEN:
+        try:
+            completed = chore_engine.complete_chore(
+                entry_data["chores"], entry_data["rewards"], hass, chore_id, timer.get("user_id"),
+                permissions=entry_data.get("permissions"),
+            )
+        except chore_engine.ChoreError as err:
+            _LOGGER.warning("Family Hub: chore timer for %s could not complete it: %s", chore_id, err)
+            completed = None
+        if completed is not None:
+            await _apply_chore_completion_effects(hass, entry_data, completed)
+            approved = completed.get("status") == chore_engine.CHORE_STATUS_APPROVED
+            result = "completed" if approved else "sent_for_approval"
+            body = (
+                f"Time's up on \"{completed.get('title')}\" - all done!"
+                if approved
+                else f"Time's up on \"{completed.get('title')}\" - sent for approval."
+            )
+    else:
+        # Deleted, or already finished by hand, mid-countdown - nothing left
+        # to say "time's up" about, so it stays quiet (and says why in the log).
+        await _log_timer_update(entry_data, timer.get("uid"), {"result": "chore_deleted" if chore is None else "chore_already_done"})
         return
-    if chore.get("status") != chore_engine.CHORE_STATUS_OPEN:
-        # Completed by hand in the seconds before the sweep ran, or reset.
-        return
-    try:
-        completed = chore_engine.complete_chore(
-            entry_data["chores"], entry_data["rewards"], hass, chore_id, timer.get("user_id"),
-            permissions=entry_data.get("permissions"),
-        )
-    except chore_engine.ChoreError as err:
-        _LOGGER.warning("Family Hub: chore timer for %s could not complete it: %s", chore_id, err)
-        return
-    await _apply_chore_completion_effects(hass, entry_data, completed)
-    # Tell them their time is up regardless of which way the completion
-    # landed - the two messages differ because "it's been sent for
-    # approval" and "you've been paid" are genuinely different news.
-    targets = timer.get("notify_targets") or []
-    approved = completed.get("status") == chore_engine.CHORE_STATUS_APPROVED
-    body = (
-        f"Time's up on \"{completed.get('title')}\" - all done!"
-        if approved
-        else f"Time's up on \"{completed.get('title')}\" - sent for approval."
-    )
-    if targets:
-        # alarm-style delivery for whoever opted into it on their
-        # own profile (see timer.get("alarm")'s own docstring) - everyone
-        # else keeps getting the plain, quiet push exactly as before.
-        send = _send_alarm_notification if timer.get("alarm") else _send_instant_notification
-        await send(hass, targets, "Family Hub chore timer", body)
-    # v1.132.55+/the WIDENED reach on top of the owner's own
-    # phone push above - alarm devices, other people's phones, and the
-    # dashboard ring. Called UNCONDITIONALLY (not gated on timer.get
-    # ("alarm")) because _dispatch_timer_alarm's own audience check is
-    # the real gate - see its docstring. - that's the CHORE's own alarm_audience
-    # setting speaking, not the kid's personal notifyTimerAlarm opt-in
-    # for their own phone (those are deliberately independent: a chore
-    # can widen to kiosks even if its owner never turned on alarm-style
-    # delivery for themselves).
+    if result:
+        await _log_timer_update(entry_data, timer.get("uid"), {"result": result})
     await _dispatch_timer_alarm(hass, entry_data, timer, "Family Hub chore timer", body)
 
 
 async def _fire_reward_timer(hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any]) -> None:
-    """A reward timer running out gates nothing - it is purely "time's up,"
-    so this only sends the notification. No approval step, no star change
-    (the stars were spent when it started), nothing to complete."""
-    targets = timer.get("notify_targets") or []
+    """A reward timer running out gates nothing - it is purely "time's up"
+    (the stars were spent when it started). Automations hang off
+    family_hub_timer_finished / family_hub_timer_cancelled."""
     title = timer.get("title") or "your reward"
-    body = f"Time's up - {title} is finished."
-    if targets:
-        send = _send_alarm_notification if timer.get("alarm") else _send_instant_notification
-        await send(hass, targets, "Family Hub reward timer", body)
-    # v1.132.55+/see _fire_chore_timer's matching block above -
-    # unconditional, gated by _dispatch_timer_alarm's own audience check.
-    await _dispatch_timer_alarm(hass, entry_data, timer, "Family Hub reward timer", body)
+    await _dispatch_timer_alarm(hass, entry_data, timer, "Family Hub reward timer", f"Time's up - {title} is finished.")
 
 
 async def _fire_standalone_timer(hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any]) -> None:
-    """A standalone (general-purpose) timer running out just says so - no
-    chore to complete, no stars, nothing gated. See TIMER_KIND_STANDALONE
-    in const.py.
-
-    Who gets told: an ASSIGNED timer notifies that person's own devices
-    (snapshotted at start, same as the other two kinds) - consistent with
-    how a reward timer already tells its owner. An UNASSIGNED one has no
-    person to notify, so it falls back to the household-wide notify
-    targets, i.e. everyone who has any target configured at all. That
-    fallback is the whole reason unassigned timers are useful: "the oven is
-    done" is news for whoever is nearest the kitchen, not for one
-    nominated person.
-    """
-    targets = list(timer.get("notify_targets") or [])
-    if not targets and not timer.get("user_id"):
-        targets = await _all_household_notify_targets(hass, entry_data)
+    """A standalone (general-purpose) timer running out just says so."""
     label = timer.get("title") or "Timer"
-    body = f"Time's up - {label}."
-    if targets:
-        # Only ever true for an ASSIGNED timer (see ws_start_standalone_
-        # timer) - the household-wide fallback for an unassigned one has
-        # no single person's setting to honor, so it always stays the
-        # plain push.
-        send = _send_alarm_notification if timer.get("alarm") else _send_instant_notification
-        await send(hass, targets, "Family Hub timer", body)
-    # - a household/standalone timer (the oven, a
-    # board game, whose turn it is - see TIMER_KIND_STANDALONE) can now
-    # carry the same "Who hears this alarm" tier as a chore/reward timer
-    # (see ws_start_standalone_timer), and this is what actually acts on
-    # it. Unconditional/self-gated exactly like the chore/reward fire
-    # helpers above - an UNASSIGNED timer has no owner and so no owner
-    # alarm-push flag to gate on in the first place, which is precisely
-    # why this can no longer be tied to that flag the way it briefly was.
-    await _dispatch_timer_alarm(hass, entry_data, timer, "Family Hub timer", body)
+    await _dispatch_timer_alarm(hass, entry_data, timer, "Family Hub timer", f"Time's up - {label}.")
 
 
 async def _all_household_notify_targets(hass: HomeAssistant, entry_data: dict[str, Any]) -> list[str]:
     """Every configured notify target in the household, de-duplicated -
-    only used for an UNASSIGNED standalone timer, which by definition has
-    nobody of its own to tell."""
+    only used for an "everyone" alarm."""
     store = entry_data.get("settings_store")
     settings = (await store.async_load() or {}) if store is not None else {}
     seen: list[str] = []
@@ -3306,60 +3848,165 @@ async def _all_household_notify_targets(hass: HomeAssistant, entry_data: dict[st
     return seen
 
 
+# ---------------------------------------------------------------------------
+# Timer alarms (v1.168.74 overhaul). Household ask: "alert a timer on
+# people's device like a Google home or on a kiosk or on a phone... only hit
+# the end devices it's supposed to hit, be persistent until turned off and
+# just work."
+#
+# EVERY finished timer rings - there is no "silent" tier any more. Where:
+#
+#   screens   the screen that started it (origin_client_id), every screen
+#             logged in as the owner (or, for an unassigned timer, as
+#             whoever started it); "kiosks" adds every login flagged as an
+#             alarm kiosk; "everyone" rings every open screen.
+#   phones    the owner's own notify targets (an unassigned timer: the
+#             starter's); "everyone" adds every phone in the house.
+#             Alarm-style (alarm stream / critical) when the owner opted in,
+#             or for an "everyone" alarm. Re-sent until stopped, with a
+#             Stop button, and cleared from every phone once stopped.
+#   speakers  each registered alarm device lists the people it rings for
+#             ("user_ids") and whether it rings for house timers with
+#             nobody assigned ("house"). A timer started with specific
+#             speakers picked uses just those. "kiosks" adds the house
+#             speakers, "everyone" every speaker. A device registered before
+#             these links existed (neither key) keeps ringing for
+#             "kiosks"/"everyone" alarms only, as it did.
+#
+# It keeps going - speakers re-announce, phones re-push, screens re-ring -
+# every ALARM_REANNOUNCE_SECONDS until someone stops it anywhere (a screen's
+# Stop, the phone notification's Stop button, the family_hub.stop_timer_alarm
+# action) or ALARM_AUTO_STOP_SECONDS passes. Ringing alarms are saved with
+# the timers, so a Home Assistant restart doesn't lose one.
+# ---------------------------------------------------------------------------
 def _active_alarms(entry_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """in-memory-only registry of currently-ringing timer
-    alarms, keyed by timer uid - deliberately not Store-persisted,
-    mirroring _kiosk_elevations above: a restart forgetting an
-    in-progress alarm is the correct failure mode here, not a bug (nobody
-    wants a phantom alarm ringing forever after Home Assistant restarts)."""
-    return entry_data.setdefault("active_alarms", {})
+    """Ringing alarms by timer uid. One dict shared between
+    entry_data["active_alarms"] and the timers Store's "alarms" key, so it
+    is saved with the timers and survives a restart."""
+    state = _timers_state(entry_data)
+    alarms = entry_data.get("active_alarms")
+    if not isinstance(alarms, dict):
+        alarms = state.get("alarms") if isinstance(state.get("alarms"), dict) else {}
+        entry_data["active_alarms"] = alarms
+    state["alarms"] = alarms
+    return alarms
+
+
+def _alarm_tag(uid: str) -> str:
+    return f"family_hub_timer_{uid}"
+
+
+def _resolve_alarm_reach(settings: dict[str, Any], timer: dict[str, Any], starter_targets: list[str]) -> dict[str, Any]:
+    """Pure: who and what rings for this timer (see the section comment)."""
+    audience = timer_engine.normalize_alarm_audience(timer.get("alarm_audience"))
+    owner = timer.get("user_id") or ""
+    person = owner or timer.get("started_by") or ""
+    profiles = settings.get("userProfiles") or {}
+
+    target_user_ids: list[str] = [person] if person else []
+    if audience in (TIMER_ALARM_AUDIENCE_KIOSKS, TIMER_ALARM_AUDIENCE_EVERYONE):
+        for uid, profile in profiles.items():
+            if isinstance(profile, dict) and profile.get(SETTINGS_KEY_PROFILE_IS_ALARM_KIOSK) and uid not in target_user_ids:
+                target_user_ids.append(uid)
+
+    own_phones = [t for t in (timer.get("notify_targets") or []) if isinstance(t, str)]
+    if not owner:
+        own_phones = [t for t in starter_targets if isinstance(t, str)]
+
+    devices = [d for d in (settings.get(SETTINGS_KEY_ALARM_DEVICES) or []) if isinstance(d, dict) and d.get("entity_id")]
+    chosen = set(timer.get("alarm_device_ids") or [])
+    picked: list[dict[str, Any]] = []
+
+    def add(device: dict[str, Any]) -> None:
+        if device not in picked:
+            picked.append(device)
+
+    for d in devices:
+        legacy = "user_ids" not in d and "house" not in d
+        if audience == TIMER_ALARM_AUDIENCE_EVERYONE:
+            add(d)
+        elif chosen:
+            if d.get("id") in chosen or d.get("entity_id") in chosen:
+                add(d)
+        elif owner and owner in (d.get("user_ids") or []):
+            add(d)
+        elif not owner and d.get("house"):
+            add(d)
+        if audience == TIMER_ALARM_AUDIENCE_KIOSKS and (d.get("house") or legacy):
+            add(d)
+    return {
+        "audience": audience,
+        "target_user_ids": target_user_ids,
+        "broadcast_all": audience == TIMER_ALARM_AUDIENCE_EVERYONE,
+        "own_phones": own_phones,
+        "devices": picked,
+    }
+
+
+async def _push_alarm_to_phones(hass: HomeAssistant, record: dict[str, Any]) -> None:
+    uid = record.get("uid") or ""
+    extra = {
+        "tag": _alarm_tag(uid),
+        "actions": [{"action": f"{ALARM_STOP_ACTION_PREFIX}{uid}", "title": "Stop"}],
+    }
+    if record.get("phones_alarm"):
+        await _send_alarm_notification(hass, record["phones_alarm"], record.get("title") or "", record.get("body") or "", extra)
+    if record.get("phones_plain"):
+        await _send_instant_notification(hass, record["phones_plain"], record.get("title") or "", record.get("body") or "", extra)
+
+
+async def _clear_alarm_on_phones(hass: HomeAssistant, record: dict[str, Any]) -> None:
+    """Companion App's own "clear_notification" message, by tag."""
+    for target in list(record.get("phones_alarm") or []) + list(record.get("phones_plain") or []):
+        split = _split_notify_target(target)
+        if split is None:
+            continue
+        try:
+            await hass.services.async_call(
+                split[0], split[1], {"message": "clear_notification", "data": {"tag": _alarm_tag(record.get("uid") or "")}}, blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Family Hub: could not clear the alarm notification on %s: %s", target, err)
 
 
 async def _announce_on_alarm_device(
     hass: HomeAssistant, device: dict[str, Any], tts_entity: Optional[str], message: str
-) -> None:
-    """Best-effort dispatch to a single registered alarm device (see
-    const.py's SETTINGS_KEY_ALARM_DEVICES) - never raises, same "a failed
-    notify must never break the underlying action" convention as
-    _send_instant_notification/_send_alarm_notification above.
-
-    An assist_satellite entry speaks for itself - assist_satellite.announce
-    handles its own TTS engine end to end. A media_player entry needs the
-    household's configured tts.* entity to speak through it (see
-    SETTINGS_KEY_ALARM_TTS_ENTITY) and is silently skipped, with a debug
-    log rather than a warning (this is an expected, unconfigured state, not
-    a failure), if none is set."""
+) -> bool:
+    """Best-effort announcement on one registered alarm device; never
+    raises. assist_satellite.announce speaks for itself; a media_player
+    (Google Home, Nest, Sonos...) speaks through the household's chosen
+    tts.* entity. Returns whether it was sent."""
     entity_id = device.get("entity_id")
-    domain = device.get("domain")
+    domain = device.get("domain") or (entity_id.split(".", 1)[0] if entity_id else "")
     if not entity_id or not domain:
-        return
+        return False
     try:
         if domain == "assist_satellite":
             await hass.services.async_call(
                 "assist_satellite", "announce", {"entity_id": entity_id, "message": message}, blocking=True,
             )
-        elif domain == "media_player":
+            return True
+        if domain == "media_player":
             if not tts_entity:
-                _LOGGER.debug(
-                    "Family Hub: skipping alarm announcement on %s - no alarmTtsEntityId configured", entity_id,
+                _LOGGER.warning(
+                    "Family Hub: can't announce the timer alarm on %s - pick a text-to-speech engine under Settings > Alarm Devices",
+                    entity_id,
                 )
-                return
+                return False
             await hass.services.async_call(
                 "tts", "speak",
                 {"entity_id": tts_entity, "media_player_entity_id": entity_id, "message": message},
                 blocking=True,
             )
-    except Exception as err:  # noqa: BLE001 - a failed alarm device must never break the underlying timer completion
+            return True
+    except Exception as err:  # noqa: BLE001 - a failed alarm device must never break the timer
         _LOGGER.warning("Family Hub: failed to announce alarm on %s: %s", entity_id, err)
+    return False
 
 
 async def _broadcast_alarm_ring(hass: HomeAssistant, entry_data: dict[str, Any], uid: str) -> None:
-    """Fire the RING event every open Family Hub dashboard subscribes to
-    via hass.connection.subscribeEvents (see const.py's
-    EVENT_FAMILY_HUB_TIMER_ALARM_RING) - re-fired by
-    _reannounce_active_alarms too, on the same cadence as the speaker
-    re-announcement, so a dashboard opened mid-alarm still catches up on
-    something that started ringing before it was even open."""
+    """The RING event every open Family Hub screen listens for; each
+    screen decides for itself whether it's one of the targets."""
     record = _active_alarms(entry_data).get(uid)
     if record is None:
         return
@@ -3369,9 +4016,12 @@ async def _broadcast_alarm_ring(hass: HomeAssistant, entry_data: dict[str, Any],
             "uid": uid,
             "title": record.get("title"),
             "body": record.get("body"),
+            "timer_title": record.get("timer_title"),
             "audience": record.get("audience"),
             "target_user_ids": record.get("target_user_ids") or [],
             "broadcast_all": bool(record.get("broadcast_all")),
+            "origin_client_id": record.get("origin_client_id") or "",
+            "started_at": record.get("started_at"),
         },
     )
 
@@ -3379,148 +4029,268 @@ async def _broadcast_alarm_ring(hass: HomeAssistant, entry_data: dict[str, Any],
 async def _dispatch_timer_alarm(
     hass: HomeAssistant, entry_data: dict[str, Any], timer: dict[str, Any], title: str, body: str
 ) -> None:
-    """The WIDENED half of a timer alarm, on top of the owner's own phone
-    push _fire_chore_timer/_fire_reward_timer/_fire_standalone_timer
-    already sent (if any - an unassigned standalone timer has no owner
-    push at all). Follow-up, - answered by giving
-    every timer kind the same alarm_audience tier, not just chores/rewards.
-    See const.py's CHORE_KEY_ALARM_AUDIENCE for the full three-tier picture
-    this implements.
-
-    Called UNCONDITIONALLY by every _fire_*_timer helper, regardless of the
-    timer's own "alarm" field (which only ever governs the STYLE of the
-    owner's own phone push - plain vs Android alarm-stream/iOS critical -
-    see timer.get("alarm")'s own docstring). This function's own audience
-    check is the real, and only, gate: a "self" audience (the default) is a
-    no-op here regardless of what "alarm" was, and a "kiosks"/"everyone"
-    audience widens the reach regardless of whether the timer's owner
-    personally opted into alarm-style delivery for their own phone -
-    deliberately decoupled, both because the chore/reward's own audience
-    setting is what the household is actually configuring (not the owner's
-    personal notification preference), and because an unassigned standalone
-    timer has no owner at all to read a personal flag off of in the first
-    place.
-
-    Deliberately resolves the actual device/kiosk/people list LIVE, off
-    current settings, rather than anything snapshotted on the timer -
-    unlike every other notify-relevant field on a timer (see
-    timer_engine.py's own docstring) - because who currently counts as a
-    registered alarm device or an always-on kiosk login can change from one
-    day to the next, and a speaker registered this morning should still
-    ring for a timer that was started this afternoon.
-    """
-    audience = timer_engine.normalize_alarm_audience(timer.get("alarm_audience"))
-    if audience == TIMER_ALARM_AUDIENCE_SELF:
-        return
+    """Start ringing for a finished timer - screens, phones and speakers as
+    resolved by _resolve_alarm_reach - and remember it until stopped."""
     uid = timer.get("uid")
     if not uid:
         return
-
     store = entry_data.get("settings_store")
     settings = (await store.async_load() or {}) if store is not None else {}
-    profiles = settings.get("userProfiles") or {}
+    starter = timer.get("started_by") if not timer.get("user_id") else None
+    starter_targets = await _notify_targets_for_user(hass, entry_data, starter) if starter else []
+    reach = _resolve_alarm_reach(settings, timer, starter_targets)
 
-    owner = timer.get("user_id")
-    target_user_ids: list[str] = [owner] if owner else []
-    for profile_user_id, profile in profiles.items():
-        if not isinstance(profile, dict):
-            continue
-        if profile.get(SETTINGS_KEY_PROFILE_IS_ALARM_KIOSK) and profile_user_id not in target_user_ids:
-            target_user_ids.append(profile_user_id)
+    own_style_alarm = bool(timer.get("alarm")) or reach["broadcast_all"]
+    phones_alarm: list[str] = list(reach["own_phones"]) if own_style_alarm else []
+    phones_plain: list[str] = [] if own_style_alarm else list(reach["own_phones"])
+    if reach["broadcast_all"]:
+        for target in await _all_household_notify_targets(hass, entry_data):
+            if target not in phones_alarm and target not in phones_plain:
+                phones_alarm.append(target)
 
-    broadcast_all = audience == TIMER_ALARM_AUDIENCE_EVERYONE
-    if broadcast_all:
-        # "Everyone" widens to every OTHER person's own phone too - "maybe
-        # parents want alarms to trigger everywhere." Deliberately NOT done
-        # for the "kiosks" tier - the household explicitly doesn't want
-        # sibling phones paged for a chore that isn't theirs.
-        other_targets = await _all_household_notify_targets(hass, entry_data)
-        if other_targets:
-            await _send_alarm_notification(hass, other_targets, title, body)
-
-    alarm_devices = [d for d in (settings.get(SETTINGS_KEY_ALARM_DEVICES) or []) if isinstance(d, dict)]
     tts_entity = settings.get(SETTINGS_KEY_ALARM_TTS_ENTITY) or None
-    message = f"{title}. {body}".strip(". ") or body
-    for device in alarm_devices:
-        await _announce_on_alarm_device(hass, device, tts_entity, message)
-
     now_iso = dt_util.utcnow().isoformat()
-    _active_alarms(entry_data)[uid] = {
+    record = {
         "uid": uid,
         "title": title,
         "body": body,
-        "audience": audience,
-        "target_user_ids": target_user_ids,
-        "broadcast_all": broadcast_all,
-        "alarm_devices": alarm_devices,
+        "timer_title": timer.get("title") or "",
+        "kind": timer.get("kind"),
+        "user_id": timer.get("user_id") or None,
+        "chore_id": timer.get("chore_id"),
+        "item_id": timer.get("item_id"),
+        "audience": reach["audience"],
+        "target_user_ids": reach["target_user_ids"],
+        "broadcast_all": reach["broadcast_all"],
+        "origin_client_id": timer.get("origin_client_id") or "",
+        "phones_alarm": phones_alarm,
+        "phones_plain": phones_plain,
+        "alarm_devices": reach["devices"],
         "tts_entity": tts_entity,
         "started_at": now_iso,
         "last_announced_at": now_iso,
+        "rings": 1,
     }
+    _active_alarms(entry_data)[uid] = record
+    await _save_timers(hass, entry_data)
+
+    message = f"{title}. {body}".strip(". ") or body
+    spoke = []
+    for device in reach["devices"]:
+        if await _announce_on_alarm_device(hass, device, tts_entity, message):
+            spoke.append(device.get("name") or device.get("entity_id"))
+    await _push_alarm_to_phones(hass, record)
     await _broadcast_alarm_ring(hass, entry_data, uid)
+
+    names = []
+    for user_id in reach["target_user_ids"]:
+        names.append(await _user_display_name(hass, user_id))
+    await _log_timer_update(entry_data, uid, {"alarm": {
+        "rang_at": now_iso,
+        "audience": reach["audience"],
+        "screens": (["every screen"] if reach["broadcast_all"] else []) + (["the screen it was started on"] if record["origin_client_id"] else []) + names,
+        "phones": phones_alarm + phones_plain,
+        "speakers": [d.get("name") or d.get("entity_id") for d in reach["devices"]],
+        "speakers_ok": spoke,
+    }})
+
+
+async def async_stop_alarm(
+    hass: HomeAssistant, entry_data: dict[str, Any], uid: str, *, by_user_id: Optional[str] = None, via: str = "screen"
+) -> bool:
+    """Silence an alarm everywhere at once ("first tap wins, from anyone").
+    Returns False if it wasn't ringing."""
+    record = _active_alarms(entry_data).pop(uid, None)
+    hass.bus.async_fire(EVENT_FAMILY_HUB_TIMER_ALARM_STOP, {"uid": uid, "stopped_by": by_user_id, "via": via})
+    if record is None:
+        return False
+    await _save_timers(hass, entry_data)
+    await _clear_alarm_on_phones(hass, record)
+    now_iso = dt_util.utcnow().isoformat()
+    by_name = await _user_display_name(hass, by_user_id) if by_user_id else None
+    hass.bus.async_fire(EVENT_FAMILY_HUB_TIMER_ALARM_STOPPED, {
+        "uid": uid,
+        "kind": record.get("kind"),
+        "title": record.get("timer_title"),
+        "user_id": record.get("user_id"),
+        "chore_id": record.get("chore_id"),
+        "reward_item_id": record.get("item_id"),
+        "stopped_by": by_user_id,
+        "via": via,
+    })
+    await _log_timer_update(entry_data, uid, {"alarm": {
+        "stopped_at": now_iso,
+        "stopped_by": by_user_id,
+        "stopped_by_name": by_name,
+        "stopped_via": via,
+        "rings": record.get("rings") or 1,
+    }})
+    return True
 
 
 async def _reannounce_active_alarms(hass: HomeAssistant, entry_data: dict[str, Any]) -> None:
-    """Called from __init__.py's own timer sweep, right after
-    _expire_due_timers, on the same TIMER_SWEEP_SECONDS cadence - see
-    const.py's ALARM_REANNOUNCE_SECONDS for why. Speakers and Assist
-    satellites have no native "keep ringing until dismissed" primitive, so
-    this is what actually makes a Family Hub alarm persist rather than
-    announcing once and going silent: every still-active alarm gets
-    re-announced on each of its registered devices (and the RING event
-    gets re-fired, so a dashboard opened mid-alarm still catches up) until
-    ws_dismiss_timer_alarm removes it from _active_alarms."""
+    """Called from the timer sweep. Keeps every ringing alarm going -
+    speakers re-announce, phones re-push (same tag, so it replaces rather
+    than stacks), screens get the RING again - every
+    ALARM_REANNOUNCE_SECONDS, and stops it after ALARM_AUTO_STOP_SECONDS."""
     active = _active_alarms(entry_data)
     if not active:
         return
     now = dt_util.utcnow()
-    for uid, record in list(active.items()):
-        last = record.get("last_announced_at")
+
+    def _parse(value: Any) -> Optional[datetime]:
         try:
-            last_dt = datetime.fromisoformat(last) if last else None
+            parsed = datetime.fromisoformat(value) if value else None
         except (TypeError, ValueError):
-            last_dt = None
+            return None
+        if parsed is not None and parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    changed = False
+    for uid, record in list(active.items()):
+        started = _parse(record.get("started_at"))
+        if started is not None and (now - started).total_seconds() >= ALARM_AUTO_STOP_SECONDS:
+            await async_stop_alarm(hass, entry_data, uid, via="auto")
+            continue
+        last_dt = _parse(record.get("last_announced_at"))
         if last_dt is not None and (now - last_dt).total_seconds() < ALARM_REANNOUNCE_SECONDS:
             continue
         message = f"{record.get('title') or ''}. {record.get('body') or ''}".strip(". ")
         tts_entity = record.get("tts_entity")
         for device in record.get("alarm_devices") or []:
             await _announce_on_alarm_device(hass, device, tts_entity, message)
+        await _push_alarm_to_phones(hass, record)
         record["last_announced_at"] = now.isoformat()
+        record["rings"] = int(record.get("rings") or 1) + 1
+        changed = True
         await _broadcast_alarm_ring(hass, entry_data, uid)
+    if changed:
+        await _save_timers(hass, entry_data)
+
+
+async def handle_mobile_notification_action(hass: HomeAssistant, event: Any) -> None:
+    """The Stop button on a timer alarm push (Companion App's
+    mobile_app_notification_action event)."""
+    action = str((event.data or {}).get("action") or "")
+    if not action.startswith(ALARM_STOP_ACTION_PREFIX):
+        return
+    entry_data = _get_entry_data(hass)
+    if entry_data is None:
+        return
+    ctx = getattr(event, "context", None)
+    await async_stop_alarm(hass, entry_data, action[len(ALARM_STOP_ACTION_PREFIX):], by_user_id=getattr(ctx, "user_id", None), via="phone")
 
 
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "family_hub/timers/dismiss_alarm",
         vol.Required("uid"): str,
+        vol.Optional("elevation_token"): str,
     }
 )
 @websocket_api.async_response
 async def ws_dismiss_timer_alarm(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    """Stop a ringing alarm everywhere at once. Household's explicit
-    choice, "first tap wins, from anyone" - so this is deliberately NOT
-    permission-gated: whoever reaches a phone, a kiosk, or the dashboard
-    first can silence it, exactly the way walking over and hitting Stop on
-    a real alarm clock doesn't ask who you are first."""
+    """Stop a ringing alarm everywhere. Not permission-gated - whoever
+    reaches a phone, a kiosk or the dashboard first can silence it."""
     entry_data = _entry_data_or_error(hass, connection, msg["id"])
     if entry_data is None:
         return
-    _active_alarms(entry_data).pop(msg["uid"], None)
-    hass.bus.async_fire(EVENT_FAMILY_HUB_TIMER_ALARM_STOP, {"uid": msg["uid"]})
+    user_id, _is_admin = await _effective_actor(hass, connection, entry_data, msg)
+    await async_stop_alarm(hass, entry_data, msg["uid"], by_user_id=user_id, via="screen")
     connection.send_result(msg["id"], {"dismissed": True})
 
 
 @websocket_api.websocket_command({vol.Required("type"): "family_hub/timers/list_active_alarms"})
 @websocket_api.async_response
 async def ws_list_active_alarms(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    """Every currently-ringing alarm, for a dashboard that just opened (or
-    reconnected) to catch up on anything already in progress rather than
-    waiting for the next re-announcement's RING event."""
+    """Every currently-ringing alarm, for a screen that just opened (or
+    reconnected) to catch up on."""
     entry_data = _entry_data_or_error(hass, connection, msg["id"])
     if entry_data is None:
         return
-    connection.send_result(msg["id"], {"alarms": list(_active_alarms(entry_data).values())})
+    alarms = [
+        {k: v for k, v in record.items() if k not in ("phones_alarm", "phones_plain", "tts_entity", "alarm_devices")}
+        for record in _active_alarms(entry_data).values()
+    ]
+    connection.send_result(msg["id"], {"alarms": alarms})
+
+
+@websocket_api.websocket_command({vol.Required("type"): "family_hub/timers/history", vol.Optional("limit"): int})
+@websocket_api.async_response
+async def ws_timer_history(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """The timer log, newest first: who set each timer, from where, how it
+    ended, where it rang and who stopped it."""
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    log = await async_load_timer_log(entry_data)
+    limit = max(1, min(int(msg.get("limit") or 100), TIMER_LOG_MAX_ENTRIES))
+    ringing = set(_active_alarms(entry_data))
+    running = {t.get("uid") for t in timer_engine.list_timers(_timers_state(entry_data))}
+    out = []
+    for entry in log[:limit]:
+        item = dict(entry)
+        item["ringing"] = item.get("uid") in ringing
+        if item.get("outcome") == "running" and item.get("uid") not in running:
+            item["outcome"] = "unknown"
+        out.append(item)
+    connection.send_result(msg["id"], {"entries": out})
+
+
+async def async_cancel_timer_by_service(
+    hass: HomeAssistant, entry_data: dict[str, Any], *, uid: Optional[str] = None, user_id: Optional[str] = None, title: Optional[str] = None
+) -> int:
+    """family_hub.cancel_timer: by uid, or every running timer matching a
+    person and/or a title. Returns how many were cancelled."""
+    state = _timers_state(entry_data)
+    matches = []
+    for timer in timer_engine.list_timers(state):
+        if uid and timer.get("uid") != uid:
+            continue
+        if user_id and timer.get("user_id") != user_id:
+            continue
+        if title and (timer.get("title") or "").strip().lower() != title.strip().lower():
+            continue
+        if not (uid or user_id or title):
+            continue
+        matches.append(timer)
+    for timer in matches:
+        cancelled = timer_engine.remove_timer(state, timer.get("uid"))
+        timer_sensor.remove_timer_sensor(entry_data, timer.get("uid"))
+        if cancelled:
+            await _release_native_timer(hass, cancelled, cancel=True)
+            await _after_timer_cancelled(hass, entry_data, cancelled, None, "automation")
+    if matches:
+        await _save_timers(hass, entry_data)
+    return len(matches)
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "family_hub/settings/test_alarm_device", vol.Required("entity_id"): str, vol.Optional("tts_entity_id"): str}
+)
+@websocket_api.async_response
+async def ws_test_alarm_device(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Settings > Alarm Devices > Test: one announcement, admin only."""
+    entry_data = _entry_data_or_error(hass, connection, msg["id"])
+    if entry_data is None:
+        return
+    if not (connection.user and connection.user.is_admin):
+        connection.send_error(msg["id"], "forbidden", "Only an admin can test alarm devices.")
+        return
+    entity_id = msg["entity_id"]
+    domain = entity_id.split(".", 1)[0]
+    if domain not in ("media_player", "assist_satellite"):
+        connection.send_error(msg["id"], "invalid", "Not a speaker or Assist satellite.")
+        return
+    tts_entity = (msg.get("tts_entity_id") or "").strip() or None
+    if domain == "media_player" and not tts_entity:
+        connection.send_result(msg["id"], {"ok": False, "reason": "no_tts"})
+        return
+    ok = await _announce_on_alarm_device(
+        hass, {"entity_id": entity_id, "domain": domain}, tts_entity, "This is a Family Hub timer alarm test."
+    )
+    connection.send_result(msg["id"], {"ok": ok, "reason": None if ok else "failed"})
 
 
 @websocket_api.websocket_command({vol.Required("type"): "family_hub/settings/list_alarm_device_candidates"})
@@ -3647,8 +4417,7 @@ async def ws_privacy_mode_list_eligible_users(hass: HomeAssistant, connection: w
     entry_data = _entry_data_or_error(hass, connection, msg["id"])
     if entry_data is None:
         return
-    settings = await _load_settings(entry_data)
-    profiles = settings.get("userProfiles") or {}
+    pins = await async_load_pins(hass, entry_data)
     try:
         ha_users = await hass.auth.async_get_users()
     except Exception:  # noqa: BLE001
@@ -3659,7 +4428,7 @@ async def ws_privacy_mode_list_eligible_users(hass: HomeAssistant, connection: w
             continue
         if not _has_permission_ctx(entry_data, u.id, bool(u.is_admin), PERMISSION_TOGGLE_PRIVACY_MODE):
             continue
-        users.append({"id": u.id, "name": u.name or u.id, "has_pin": bool((profiles.get(u.id) or {}).get("pinHash"))})
+        users.append({"id": u.id, "name": u.name or u.id, "has_pin": bool(pins.get(u.id))})
     connection.send_result(msg["id"], {"users": users})
 
 
@@ -3678,18 +4447,10 @@ async def ws_privacy_mode_disable_with_pin(hass: HomeAssistant, connection: webs
     entry_data = _entry_data_or_error(hass, connection, msg["id"])
     if entry_data is None:
         return
-    settings = await _load_settings(entry_data)
-    profile = (settings.get("userProfiles") or {}).get(msg["user_id"]) or {}
-    salt = profile.get("pinSalt")
-    stored_hash = profile.get("pinHash")
     is_admin = await _ha_user_is_admin(hass, msg["user_id"])
-    if (
-        not salt
-        or not stored_hash
-        or _hash_pin(msg["pin"], salt) != stored_hash
-        or not _has_permission_ctx(entry_data, msg["user_id"], is_admin, PERMISSION_TOGGLE_PRIVACY_MODE)
-    ):
-        connection.send_error(msg["id"], "incorrect_pin", "Incorrect PIN.")
+    result = await async_verify_pin(hass, entry_data, msg["user_id"], msg["pin"])
+    if result != "ok" or not _has_permission_ctx(entry_data, msg["user_id"], is_admin, PERMISSION_TOGGLE_PRIVACY_MODE):
+        _send_pin_error(connection, msg["id"], result if result != "ok" else "incorrect", entry_data, msg["user_id"])
         return
     await privacy_mode_shared.async_set_privacy_mode(hass, entry_data, False)
     device_settings_switch.notify_privacy_mode(entry_data)
@@ -3704,6 +4465,7 @@ ALL_COMMANDS = (
     ws_clear_all_chores,
     ws_assign_chore,
     ws_claim_chore,
+    ws_set_chore_in_progress,
     ws_complete_chore,
     ws_approve_chore,
     ws_reject_chore,
@@ -3731,6 +4493,10 @@ ALL_COMMANDS = (
     ws_kiosk_set_pin,
     ws_kiosk_elevate,
     ws_kiosk_deelevate,
+    ws_more_menu_locked_set,
+    ws_more_menu_locked_get_for_edit,
+    ws_more_menu_unlock_options,
+    ws_more_menu_unlock,
     ws_list_routines,
     ws_list_routine_library,
     ws_create_routine_item,
@@ -3758,6 +4524,8 @@ ALL_COMMANDS = (
     # dashboard ring) - see _dispatch_timer_alarm's own docstring.
     ws_dismiss_timer_alarm,
     ws_list_active_alarms,
+    ws_timer_history,
+    ws_test_alarm_device,
     ws_list_alarm_device_candidates,
     # Privacy mode.
     ws_privacy_mode_get_state,

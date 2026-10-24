@@ -31,6 +31,7 @@ import base64
 import difflib
 import hashlib
 import html
+import ipaddress
 import itertools
 import json
 import logging
@@ -38,14 +39,20 @@ import math
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from collections.abc import Iterable
 from typing import Any, Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import aiohttp
 import voluptuous as vol
 
 from homeassistant.components import panel_custom, websocket_api
+from homeassistant.components.http import HomeAssistantView, StaticPathConfig
+from aiohttp import web
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import __version__ as HA_CORE_VERSION
+from homeassistant.core import HomeAssistant, ServiceCall
 # CalendarEntityFeature/DATA_COMPONENT - needed to delete/update/create
 # calendar events directly against the entity (entity.async_delete_event/
 # async_update_event/async_create_event), the same way Home Assistant's
@@ -63,10 +70,6 @@ from homeassistant.components import panel_custom, websocket_api
 # own schema has no rrule field - rrule is websocket/entity-only too).
 from homeassistant.components.calendar import CalendarEntityFeature
 from homeassistant.components.calendar.const import DATA_COMPONENT
-from homeassistant.components.http import StaticPathConfig
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import __version__ as HA_CORE_VERSION
-from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -90,6 +93,7 @@ from homeassistant.util import slugify
 from . import chore_engine
 from . import pantry_engine
 from . import reward_engine
+from . import timer_engine
 from . import routine_engine
 from . import store as chores_store
 from . import chores_websocket_api as chores_ws_api
@@ -106,6 +110,7 @@ from .const import (
     CONF_GROCY_LOW_STOCK_ENABLED,
     CONF_GROCY_URL,
     CONF_INITIAL_GOALS_IN_CHORES,
+    CONF_INITIAL_CALENDARS,
     CONF_INITIAL_GOALS_IN_REWARDS,
     CONF_INITIAL_MEMBER_USER_IDS,
     CONF_INITIAL_ROUTINES_ENABLED,
@@ -169,11 +174,15 @@ from .const import (
     TODO_CARD_JS_URL,
     ACTIVE_TIMERS_CARD_JS_URL,
     RECIPE_BOX_CARD_JS_URL,
+    RIGHT_NOW_CARD_JS_URL,
     SERVICE_CREATE_CHORE,
     SERVICE_COMPLETE_CHORE,
     SERVICE_APPROVE_CHORE,
     SERVICE_REJECT_CHORE,
     SERVICE_NUDGE_USER,
+    SERVICE_CANCEL_TIMER,
+    SERVICE_START_TIMER,
+    SERVICE_STOP_TIMER_ALARM,
     GROCERY_PUSHED_STORAGE_KEY_PREFIX,
     GROCERY_PUSHED_STORAGE_VERSION,
     GROCY_CONVERSIONS_SYNC_GENERATION,
@@ -194,6 +203,7 @@ from .const import (
     PERMISSION_SEE_WISHLIST_CLAIMS,
     PERMISSION_DELETE_EVENT,
     PERMISSION_EDIT_EVENT,
+    CALENDAR_ENTITY_FEATURE_CREATE_EVENT,
     CALENDAR_ENTITY_FEATURE_DELETE_EVENT,
     CALENDAR_ENTITY_FEATURE_UPDATE_EVENT,
     CALENDAR_PLATFORM_FRIENDLY_NAMES,
@@ -425,7 +435,34 @@ def _seed_themes() -> list[dict]:
             accent2="#32d1e0", accent3="#ff6961", surface_alt="#242c3d", surface2="#20283a",
             card_opacity=55, glass_blur=18, bg_image=_liquid_glass_bg_image(dark=True),
         ),
+        # v1.168.76: "a light mode and a dark mode that more similarly
+        # mirror home assistants theme". Home Assistant's own default light
+        # and dark colors (page #fafafa / #111111, cards #ffffff / #1c1c1c,
+        # text #212121 / #e1e1e1, secondary text #727272 / #9b9b9b, the
+        # light-blue #03a9f4 primary, a 12% divider) with HA's flat cards:
+        # a thin divider-colored border and no drop shadow. Neutral grey
+        # chip/block surfaces (the same 6-8% tint the Home Calendar Card's
+        # "auto" look uses) so people's own calendar colors carry the color.
+        _ha_flat(_theme(
+            "halight", "HA Light",
+            bg="#fafafa", card="#ffffff", border="#e0e0e0", text="#212121",
+            text_secondary="#727272", accent="#03a9f4", accent_text="#ffffff",
+            accent2="#43a047", accent3="#ff9800", surface_alt="#f2f2f2", surface2="#f6f6f6",
+        )),
+        _ha_flat(_theme(
+            "hadark", "HA Dark",
+            bg="#111111", card="#1c1c1c", border="#2e2e2e", text="#e1e1e1",
+            text_secondary="#9b9b9b", accent="#03a9f4", accent_text="#ffffff",
+            accent2="#66bb6a", accent3="#ffa726", surface_alt="#262626", surface2="#222222",
+        )),
     ]
+
+
+def _ha_flat(theme: dict) -> dict:
+    """Home Assistant's own card look: no drop shadow, 1px border."""
+    theme["effects"]["shadow"] = {**theme["effects"]["shadow"], "enabled": False}
+    theme["borderWidth"] = 1
+    return theme
 
 
 def _migrate_theme(theme: dict) -> dict:
@@ -672,6 +709,215 @@ def _overrides_to_text(overrides: dict[str, list[str]]) -> str:
     return "\n".join(
         f"{entity} = {','.join(targets)}" for entity, targets in sorted(overrides.items()) if targets
     )
+
+
+def _calendar_entities_from_people(people: Any) -> set[str]:
+    """Every calendar.* entity a people[] list references - each row's
+    own primary `entity` plus any of its `extraEntities` (the multi-
+    calendar-per-person overlay list, Settings > General > that
+    person's row > "Also show events from") - used to diff an old vs
+    new Settings save and tell which calendars a household just
+    removed from Family Hub's own Calendars section entirely (see this
+    function's own call site in _ws_set_settings).
+    """
+    result: set[str] = set()
+    if not isinstance(people, list):
+        return result
+    for p in people:
+        if not isinstance(p, dict):
+            continue
+        entity = p.get("entity")
+        if isinstance(entity, str) and entity.strip():
+            result.add(entity.strip())
+        extras = p.get("extraEntities")
+        if isinstance(extras, list):
+            for extra_entity in extras:
+                if isinstance(extra_entity, str) and extra_entity.strip():
+                    result.add(extra_entity.strip())
+    return result
+
+
+async def _cleanup_removed_calendar_entity(
+    hass: HomeAssistant, entry: ConfigEntry, entry_data: dict[str, Any], entity_id: str
+) -> None:
+    """Household ask: a calendar deleted/removed from Home Assistant should
+    stop being referenced by Family Hub's own notification config, rather
+    than silently sitting in "Calendars to monitor" (or a person's
+    subscribedCalendars, or a per-calendar notify override) forever,
+    pointed at an entity that no longer exists. Wired to the core entity
+    registry's own "entity_registry_updated" bus event with action==
+    "remove" (see this function's own call site in async_setup_entry) -
+    a real-time signal that the entity is gone, rather than waiting for
+    the next poll to start erroring against it.
+
+    Three things, each independently, when entity_id is present in them:
+      - CONF_CALENDARS ("Calendars to monitor," Settings > General) -
+        _add_monitored_calendars never removes anything on its own, so
+        nothing else in this file was ever going to clean this up.
+      - CONF_OVERRIDES_TEXT (per-calendar notify device overrides) -
+        stale the moment the calendar it targeted no longer exists.
+      - every profile's subscribedCalendars (Settings > Users > that
+        person > Calendars) - the same mismatch _sync_subscribed_
+        calendars_monitored's own docstring describes, just in the
+        other direction (an entity that's gone, instead of one that was
+        never added).
+
+    Deliberately leaves `people`/`extraEntities` (the calendar GRID's own
+    display config, Settings > General > that person's row) untouched -
+    removing someone's primary calendar there would silently restructure
+    their whole dashboard column, a bigger and more disruptive change
+    than "stop notifying about a calendar that's gone," and nothing
+    asked for that.
+    """
+    changed_options = False
+    new_options = dict(entry.options)
+    calendars = list(new_options.get(CONF_CALENDARS, []))
+    if entity_id in calendars:
+        calendars.remove(entity_id)
+        new_options[CONF_CALENDARS] = calendars
+        changed_options = True
+    overrides = _parse_overrides(new_options.get(CONF_OVERRIDES_TEXT, ""))
+    if entity_id in overrides:
+        del overrides[entity_id]
+        new_options[CONF_OVERRIDES_TEXT] = _overrides_to_text(overrides)
+        changed_options = True
+    if changed_options:
+        hass.config_entries.async_update_entry(entry, options=new_options)
+
+    settings_store: Store | None = entry_data.get("settings_store")
+    if settings_store is None:
+        return
+    settings = await settings_store.async_load()
+    if not isinstance(settings, dict):
+        return
+    profiles = settings.get("userProfiles")
+    if not isinstance(profiles, dict):
+        return
+    settings_changed = False
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        subscribed = profile.get("subscribedCalendars")
+        if isinstance(subscribed, list) and entity_id in subscribed:
+            profile["subscribedCalendars"] = [e for e in subscribed if e != entity_id]
+            settings_changed = True
+    if settings_changed:
+        await settings_store.async_save(settings)
+        await _backup_settings(hass, settings)
+
+
+async def _handle_renamed_calendar_entity(
+    hass: HomeAssistant, entry: ConfigEntry, entry_data: dict[str, Any], old_entity_id: str, new_entity_id: str
+) -> None:
+    """Household gap: _cleanup_removed_calendar_entity only ever heard
+    about a calendar.* entity being deleted (action=="remove"). Home
+    Assistant lets you rename an entity_id from Settings > Devices &
+    Services without deleting it, which fires the SAME entity_registry_
+    updated bus event but with action=="update" and an old_entity_id
+    field instead - a case nothing was listening for, so every place
+    that stored the old entity_id (CONF_CALENDARS, CONF_OVERRIDES_TEXT,
+    every profile's subscribedCalendars, AND people/extraEntities) kept
+    pointing at an id that no longer resolves to anything, silently
+    breaking both notifications and the dashboard column for that
+    calendar until someone noticed and re-added it by hand under its
+    new name. This is that listener's other half: same four places,
+    but SWAP old_entity_id -> new_entity_id in each rather than just
+    deleting old_entity_id, since the calendar is still wanted, it just
+    has a new address.
+
+    people/extraEntities is deliberately included here (unlike the
+    removal cleanup, which explicitly leaves it alone) - a rename isn't
+    a household decision to stop showing that calendar, so the dashboard
+    column should keep working across the rename exactly like every
+    other config, not be the one thing left broken.
+    """
+    changed_options = False
+    new_options = dict(entry.options)
+    calendars = list(new_options.get(CONF_CALENDARS, []))
+    if old_entity_id in calendars:
+        if new_entity_id in calendars:
+            calendars = [e for e in calendars if e != old_entity_id]
+        else:
+            calendars = [new_entity_id if e == old_entity_id else e for e in calendars]
+        new_options[CONF_CALENDARS] = calendars
+        changed_options = True
+    overrides = _parse_overrides(new_options.get(CONF_OVERRIDES_TEXT, ""))
+    if old_entity_id in overrides:
+        old_targets = overrides.pop(old_entity_id)
+        existing_targets = overrides.get(new_entity_id, [])
+        merged_targets = list(existing_targets)
+        for target in old_targets:
+            if target not in merged_targets:
+                merged_targets.append(target)
+        overrides[new_entity_id] = merged_targets
+        new_options[CONF_OVERRIDES_TEXT] = _overrides_to_text(overrides)
+        changed_options = True
+    if changed_options:
+        hass.config_entries.async_update_entry(entry, options=new_options)
+
+    settings_store: Store | None = entry_data.get("settings_store")
+    if settings_store is None:
+        return
+    settings = await settings_store.async_load()
+    if not isinstance(settings, dict):
+        return
+    settings_changed = False
+
+    profiles = settings.get("userProfiles")
+    if isinstance(profiles, dict):
+        for profile in profiles.values():
+            if not isinstance(profile, dict):
+                continue
+            subscribed = profile.get("subscribedCalendars")
+            if isinstance(subscribed, list) and old_entity_id in subscribed:
+                if new_entity_id in subscribed:
+                    profile["subscribedCalendars"] = [e for e in subscribed if e != old_entity_id]
+                else:
+                    profile["subscribedCalendars"] = [
+                        new_entity_id if e == old_entity_id else e for e in subscribed
+                    ]
+                settings_changed = True
+            # primaryCalendar/extraCalendars are also calendar.*
+            # entity ids now (see _defaultUserProfile's own comment
+            # on extraCalendars, added alongside this rename
+            # handler) - a household whose calendar is set purely
+            # via the Users tab, with no matching people[] row at
+            # all, would otherwise keep pointing at the renamed-
+            # away old id forever.
+            if profile.get("primaryCalendar") == old_entity_id:
+                profile["primaryCalendar"] = new_entity_id
+                settings_changed = True
+            extra_calendars = profile.get("extraCalendars")
+            if isinstance(extra_calendars, list) and old_entity_id in extra_calendars:
+                if new_entity_id in extra_calendars:
+                    profile["extraCalendars"] = [e for e in extra_calendars if e != old_entity_id]
+                else:
+                    profile["extraCalendars"] = [
+                        new_entity_id if e == old_entity_id else e for e in extra_calendars
+                    ]
+                settings_changed = True
+
+    people = settings.get("people")
+    if isinstance(people, list):
+        for person in people:
+            if not isinstance(person, dict):
+                continue
+            if person.get("entity") == old_entity_id:
+                person["entity"] = new_entity_id
+                settings_changed = True
+            extras = person.get("extraEntities")
+            if isinstance(extras, list) and old_entity_id in extras:
+                if new_entity_id in extras:
+                    person["extraEntities"] = [e for e in extras if e != old_entity_id]
+                else:
+                    person["extraEntities"] = [
+                        new_entity_id if e == old_entity_id else e for e in extras
+                    ]
+                settings_changed = True
+
+    if settings_changed:
+        await settings_store.async_save(settings)
+        await _backup_settings(hass, settings)
 
 
 # --- Per-user notification profiles -----------------------------------------
@@ -1046,6 +1292,106 @@ async def _maybe_seed_settings_from_setup_wizard(
     await _backup_settings(hass, settings)
 
 
+_SEED_CALENDAR_PALETTE = ["#a9c6c2", "#dba99c", "#d9bf7e", "#a8bd93", "#b9a7c9", "#cf8f6c", "#a89a83"]
+
+
+def _normalize_hex_color(value: Any) -> str:
+    """'#RGB'/'#RRGGBB' (any case) -> '#rrggbb', anything else -> ''."""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
+    if len(v) == 4 and v.startswith("#") and all(c in "0123456789abcdef" for c in v[1:]):
+        v = "#" + "".join(c * 2 for c in v[1:])
+    if len(v) == 7 and v.startswith("#") and all(c in "0123456789abcdef" for c in v[1:]):
+        return v
+    return ""
+
+
+def _calendar_entity_colors(hass: HomeAssistant) -> dict[str, str]:
+    """v1.168.75: each calendar entity's own color from Home Assistant
+    (Home Assistant 2026.2+ keeps one per calendar in the entity registry
+    options; the Google Calendar integration fills it in from Google)."""
+    colors: dict[str, str] = {}
+    try:
+        registry = er.async_get(hass)
+        entries = list(getattr(registry, "entities", {}).values())
+    except Exception:  # noqa: BLE001
+        return colors
+    for entry in entries:
+        entity_id = getattr(entry, "entity_id", "") or ""
+        if not entity_id.startswith("calendar."):
+            continue
+        options = getattr(entry, "options", None) or {}
+        color = _normalize_hex_color(((options.get("calendar") or {}) if isinstance(options, dict) else {}).get("color"))
+        if color:
+            colors[entity_id] = color
+    return colors
+
+
+async def _maybe_seed_calendar_rows_from_setup_wizard(
+    hass: HomeAssistant, entry: ConfigEntry, settings_store: Store
+) -> None:
+    """One-time seed of Settings > Calendars rows (settings["people"]) from
+    the setup wizard's Calendars step (CONF_INITIAL_CALENDARS - the picked
+    calendars that aren't a member's own calendar; see config_flow.py's
+    async_step_calendars).
+
+    v1.168.60 (calendar UX review): before this, nothing the wizard asked
+    about calendars ever reached the calendar card, so every fresh install
+    opened on "No Calendar Configured".
+
+    Only ever seeds a household whose settings have NO "people" key at all.
+    The card's own Settings save always writes that key (even as []), so
+    its absence reliably means "nobody has configured calendars yet" - this
+    can never overwrite, re-add or duplicate anything a household set up
+    (or deliberately removed) themselves. Each row is named from Home
+    Assistant's own name for the calendar, in the same row shape the card
+    writes.
+    """
+    entities = entry.options.get(CONF_INITIAL_CALENDARS)
+    if not entities:
+        return
+    settings = await settings_store.async_load() or {}
+    if "people" in settings:
+        return
+    profiles = settings.get(SETTINGS_KEY_USER_PROFILES) or {}
+    member_calendars = {
+        p.get("primaryCalendar") for p in profiles.values() if isinstance(p, dict) and p.get("primaryCalendar")
+    }
+    rows: list[dict[str, Any]] = []
+    ha_colors = _calendar_entity_colors(hass)
+    for entity in entities:
+        if not isinstance(entity, str) or not entity.startswith("calendar.") or entity in member_calendars:
+            continue
+        if any(r["entity"] == entity for r in rows):
+            continue
+        state = hass.states.get(entity) if hasattr(hass, "states") else None
+        friendly = ""
+        if state is not None:
+            friendly = str((getattr(state, "attributes", None) or {}).get("friendly_name") or "")
+        name = (friendly or entity.split(".", 1)[1].replace("_", " ").title()).strip()
+        if len(name) > 20:
+            cut = name[:20]
+            name = (cut[: cut.rfind(" ")] if cut.rfind(" ") > 8 else cut).strip()
+        rows.append(
+            {
+                "entity": entity,
+                "name": name,
+                # v1.168.75: the calendar's own color (from Google) when it has one
+                "color": ha_colors.get(entity) or _SEED_CALENDAR_PALETTE[len(rows) % len(_SEED_CALENDAR_PALETTE)],
+                "colorLockedToProfile": True,
+                "countdown": False,
+                "badges": [],
+                "remindersEntity": "",
+            }
+        )
+    if not rows:
+        return
+    settings["people"] = rows
+    await settings_store.async_save(settings)
+    await _backup_settings(hass, settings)
+
+
 async def _maybe_migrate_member_user_ids(
     hass: HomeAssistant, settings_store: Store, permissions: dict[str, Any]
 ) -> None:
@@ -1214,6 +1560,29 @@ async def _backup_settings(hass: HomeAssistant, settings: dict[str, Any]) -> Non
         _LOGGER.warning("Family Hub: could not write settings backup file: %s", err)
 
 
+# v1.168.83: household ask - "For all new installs moving forward, slate
+# should be the default." The cards fall back to DEFAULT_GLOBAL_THEME_ID
+# whenever Settings has no globalThemeId of its own, so changing that alone
+# would also flip any existing household that never saved Settings from
+# Liquid Glass (the old default) to Slate. Instead the choice is written
+# into Settings once: Slate on a brand-new install (an empty store, after
+# the backup restore above), the old Liquid Glass default on an existing
+# one that never picked a theme. Anything already saved is left alone.
+DEFAULT_GLOBAL_THEME_ID = "slate"
+PREVIOUS_DEFAULT_GLOBAL_THEME_ID = "liquidglass"
+
+
+async def _pin_default_global_theme(hass: HomeAssistant, settings_store: Store) -> None:
+    settings = await settings_store.async_load()
+    if isinstance(settings, dict) and "globalThemeId" in settings:
+        return
+    is_new_install = not settings
+    settings = dict(settings) if isinstance(settings, dict) else {}
+    settings["globalThemeId"] = DEFAULT_GLOBAL_THEME_ID if is_new_install else PREVIOUS_DEFAULT_GLOBAL_THEME_ID
+    await settings_store.async_save(settings)
+    await _backup_settings(hass, settings)
+
+
 async def _maybe_restore_settings_backup(hass: HomeAssistant, settings_store: Store) -> None:
     """If this entry's Settings Store loads completely empty - the signature
     of a brand-new entry_id that's never been written to, most commonly
@@ -1350,6 +1719,68 @@ async def _manual_backup_settings_history(hass: HomeAssistant, entry_data: dict[
     history["snapshots"] = snapshots
     await history_store.async_save(history)
     return candidate
+
+
+class FamilyHubSettingsHistoryExportView(HomeAssistantView):
+    """Serves one Settings-history snapshot as a downloadable .json file -
+    the real browser-download counterpart to config_flow.py's
+    _write_backup_export_file, which only ever wrote a copy into
+    <config>/family_hub_backups/exports/ for an admin to go fetch by hand
+    (Samba/SSH/a Terminal add-on). Household ask, verbatim: "allow backups
+    to be downloaded and uploaded as well" - uploading an exported file
+    back in already worked (async_step_import_backup's FileSelector field
+    is a real browser file-upload control), so this is the other half.
+
+    config_flow.py's async_step_export_backup signs a short-lived URL to
+    this view with homeassistant.components.http.auth.async_sign_path -
+    the same mechanism Home Assistant itself uses for camera/image URLs
+    (e.g. /api/image/serve/...) - so clicking the link in the export
+    confirmation screen downloads the file straight from the admin's own
+    browser, no separate auth step needed, and the signature expires
+    rather than leaving a permanent unauthenticated hole.
+
+    Admin-gated on top of that (the signed path only proves the request
+    came from a signed link, not that the signer was an admin at the
+    time it's clicked), and resolves the entry_id + index fresh against
+    the live settings-history store on every request rather than baking
+    the snapshot content into the URL itself, so a since-pruned/rotated
+    snapshot 404s cleanly instead of ever serving stale or missing data.
+    """
+
+    url = "/api/family_hub/settings_history_export/{entry_id}/{index}"
+    name = "api:family_hub:settings_history_export"
+    requires_auth = True
+
+    async def get(self, request: "web.Request", entry_id: str, index: str) -> "web.Response":
+        hass: HomeAssistant = request.app["hass"]
+        hass_user = request.get("hass_user")
+        if hass_user is None or not hass_user.is_admin:
+            return web.Response(status=403)
+        entry_data = hass.data.get(DOMAIN, {}).get("entries", {}).get(entry_id)
+        if entry_data is None:
+            return web.Response(status=404)
+        history_store: Store | None = entry_data.get("settings_history_store")
+        if history_store is None:
+            return web.Response(status=404)
+        history = await chores_store.async_load_settings_history(history_store)
+        snapshots = history.get("snapshots") or []
+        try:
+            idx = int(index)
+        except ValueError:
+            return web.Response(status=400)
+        if idx < 0 or idx >= len(snapshots):
+            return web.Response(status=404)
+        snapshot = snapshots[idx]
+        raw_timestamp = snapshot.get("timestamp")
+        safe_timestamp = re.sub(r"[^0-9A-Za-z]+", "-", str(raw_timestamp or "unknown")).strip("-")
+        filename = f"family_hub_backup_{safe_timestamp}.json"
+        body = json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8")
+        return web.Response(
+            body=body,
+            content_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
 
 
 @websocket_api.websocket_command({vol.Required("type"): "family_hub/backup_settings_now"})
@@ -1710,9 +2141,9 @@ async def _build_debug_info(hass: HomeAssistant, entry: ConfigEntry, entry_data:
     into a GitHub issue or shared with support, and the real content of a
     household's calendars/chores/permissions has no business leaving the
     browser for that. The one exception is userProfiles' own ids/names/
-    flags (not pinHash/pinSalt, never included in the settings blob this
-    reads - see _ws_set_settings's own docstring on why those two never
-    even reach the frontend), since "which members exist and what's
+    flags - built field by field below, so a profile's pinHash/pinSalt
+    (which DO live in this settings blob - see _ws_set_settings's
+    docstring) are never copied into it - since "which members exist and what's
     enabled for them" is exactly the kind of thing a migration/permissions
     bug report needs to show.
 
@@ -1836,7 +2267,7 @@ async def _ws_get_notify_config(
     )
 
 
-def _add_monitored_calendars(existing: list[str], new_entities: "Iterable[str]") -> list[str]:
+def _add_monitored_calendars(existing: list[str], new_entities: Iterable[str]) -> list[str]:
     """Return existing + any of new_entities not already present, order-preserving.
 
     Never removes anything - the card's UI (notify picker, per-event reminder
@@ -2030,6 +2461,61 @@ def _migrate_people_reminders_into_profiles(settings: dict[str, Any]) -> bool:
     return changed
 
 
+def _migrate_people_extra_calendars_into_profiles(settings: dict[str, Any]) -> bool:
+    """Household ask, verbatim: "you should add the person's
+    additional calendar under their user." Same move
+    _migrate_people_reminders_into_profiles already made for
+    remindersEntity, just for the "also show events from" overlay
+    calendars: settings.people[i].extraEntities (the OLD per-calendar-
+    row editor, gone from the card's UI as of this version) moves onto
+    settings.userProfiles[user_id].extraCalendars (the Users tab's new
+    field) for every people[] row that's some profile's primaryCalendar.
+
+    A people[] row whose calendar entity isn't anybody's primaryCalendar
+    is left untouched (same as the reminders migration) - there's
+    nowhere to move it TO, so it keeps being read directly off that row
+    (see the card's own _getPeople, which only prefers a profile's
+    extraCalendars when that profile's primaryCalendar actually claims
+    this entity).
+
+    Idempotent, called both on load and on save - see
+    _migrate_people_reminders_into_profiles's own docstring for why.
+    Mutates `settings` in place and returns True if it changed
+    anything.
+    """
+    people = settings.get("people")
+    profiles = settings.get(SETTINGS_KEY_USER_PROFILES)
+    if not isinstance(people, list) or not isinstance(profiles, dict):
+        return False
+    changed = False
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        entity = person.get("entity")
+        extra_entities = person.get("extraEntities")
+        if not isinstance(entity, str) or not entity.strip():
+            continue
+        if not isinstance(extra_entities, list) or not extra_entities:
+            continue
+        entity = entity.strip()
+        cleaned_extra = [e.strip() for e in extra_entities if isinstance(e, str) and e.strip()]
+        if not cleaned_extra:
+            continue
+        matched = False
+        for profile in profiles.values():
+            if not isinstance(profile, dict) or profile.get("primaryCalendar") != entity:
+                continue
+            matched = True
+            existing = profile.get("extraCalendars")
+            if not (isinstance(existing, list) and existing):
+                profile["extraCalendars"] = cleaned_extra
+                changed = True
+        if matched:
+            person["extraEntities"] = []
+            changed = True
+    return changed
+
+
 @websocket_api.websocket_command({vol.Required("type"): "family_hub/get_settings"})
 @websocket_api.async_response
 async def _ws_get_settings(
@@ -2059,9 +2545,21 @@ async def _ws_get_settings(
         connection.send_error(msg["id"], "not_found", "Family Hub is not set up")
         return
     store: Store = entry_data["settings_store"]
+    # v1.168.71: move any kiosk PIN hash still in the settings blob into
+    # its private store first (see chores_websocket_api's "kiosk PIN
+    # storage" section), so it's never sent to anyone from here.
+    await chores_ws_api.async_load_pins(hass, entry_data)
     settings = await store.async_load()
-    if isinstance(settings, dict) and _migrate_people_reminders_into_profiles(settings):
+    migrated = False
+    if isinstance(settings, dict):
+        if _migrate_people_reminders_into_profiles(settings):
+            migrated = True
+        if _migrate_people_extra_calendars_into_profiles(settings):
+            migrated = True
+    if migrated:
         await store.async_save(settings)
+    if isinstance(settings, dict):
+        chores_ws_api._strip_pins_from_settings(settings)
     connection.send_result(msg["id"], {"settings": settings})
 
 
@@ -2110,10 +2608,13 @@ async def _ws_set_settings(
     hit the exact same class of bug with a kiosk PIN's
     pinHash/pinSalt (chores_websocket_api.py's ws_kiosk_set_pin writes
     those two fields directly to the store, deliberately bypassing this
-    handler entirely so the general, ungated set_settings command could
-    never be used to plant a PIN - see that section's own module
-    docstring). The card's JS never reads pinHash/pinSalt back at all (by
-    design - a PIN hash/salt has no business ever reaching a browser), so
+    handler - see that section's own module docstring). KNOWN OPEN ISSUE
+    (flagged in the v1.168.59 review, not yet fixed): ws_kiosk_set_pin
+    writes them into userProfiles in THIS SAME settings blob, so (a)
+    _ws_get_settings returns every member's pinHash/pinSalt to any
+    connection, and (b) this handler accepts a pinHash/pinSalt pair in an
+    incoming profile, so any connection can plant a PIN here. The card's
+    JS never reads pinHash/pinSalt back itself, so
     _normalizeUserProfiles's per-user object literal simply doesn't carry
     those two keys, and every ordinary Settings save - even one totally
     unrelated to kiosk login, e.g. toggling someone else's color - was
@@ -2130,6 +2631,13 @@ async def _ws_set_settings(
     path (which explicitly pops both keys before saving) is never
     second-guessed by this carry-forward the next time an ordinary
     Settings save happens to run after it.
+
+    v1.168.71 UPDATE - the paragraph above is history: PIN hashes moved to
+    their own private store (chores_websocket_api's "kiosk PIN storage"
+    section), this handler strips any pinHash/pinSalt it is sent instead
+    of carrying them forward, and _ws_get_settings never returns them. The
+    "wrong PIN after an unrelated save" bug can't come back because the
+    hashes are no longer in this blob at all.
     """
     entry_data = _get_family_hub_entry_data(hass)
     if entry_data is None:
@@ -2137,10 +2645,21 @@ async def _ws_set_settings(
         return
     store: Store = entry_data["settings_store"]
     new_settings = dict(msg["settings"])
+    # v1.168.71: PIN hashes are never accepted from a client (that was the
+    # "plant a PIN" half of issue #2), and any still in the stored blob are
+    # moved to the private PIN store before this full replace runs.
+    if isinstance(new_settings.get("userProfiles"), dict):
+        new_settings["userProfiles"] = {k: (dict(v) if isinstance(v, dict) else v) for k, v in new_settings["userProfiles"].items()}
+    chores_ws_api._strip_pins_from_settings(new_settings)
+    await chores_ws_api.async_load_pins(hass, entry_data)
+    # v1.168.71: a locked More-menu pop-up's content never sits in this
+    # readable blob (see chores_websocket_api's locked pop-ups section)
+    chores_ws_api.strip_locked_popup_content(new_settings)
     needs_existing = (
         SETTINGS_KEY_NOTIFY_PROFILES_MIGRATED not in new_settings
         or SETTINGS_KEY_WISHLIST_CLAIMS_PERMISSION_MIGRATED not in new_settings
         or "userProfiles" in new_settings
+        or "people" in new_settings
     )
     if needs_existing:
         existing = await store.async_load() or {}
@@ -2170,32 +2689,95 @@ async def _ws_set_settings(
             new_settings[SETTINGS_KEY_WISHLIST_CLAIMS_PERMISSION_MIGRATED] = True
         existing_profiles = existing.get("userProfiles")
         new_profiles = new_settings.get("userProfiles")
-        if isinstance(existing_profiles, dict) and isinstance(new_profiles, dict):
-            for user_id, existing_profile in existing_profiles.items():
-                if not isinstance(existing_profile, dict):
-                    continue
-                pin_hash = existing_profile.get("pinHash")
-                pin_salt = existing_profile.get("pinSalt")
-                if not pin_hash or not pin_salt:
-                    continue
-                incoming_profile = new_profiles.get(user_id)
-                if not isinstance(incoming_profile, dict):
-                    continue
-                if "pinHash" not in incoming_profile and "pinSalt" not in incoming_profile:
-                    incoming_profile["pinHash"] = pin_hash
-                    incoming_profile["pinSalt"] = pin_salt
+        # (v1.168.71: the PIN-hash carry-forward that used to be here is
+        # gone - PIN hashes live in their own store now and are never part
+        # of this blob, so an ordinary save can't drop or plant one.)
         if isinstance(new_profiles, dict):
             await _sync_profile_wishlist_flags(
                 hass, entry_data, existing_profiles if isinstance(existing_profiles, dict) else {}, new_profiles
             )
+            _sync_subscribed_calendars_monitored(hass, new_profiles)
+        # Household ask: a calendar removed from Family Hub's own
+        # Calendars section (Settings > General, the person row's own
+        # ✕, or dropping one of its "Also show events from" extras)
+        # should stop being referenced by notifications too, not just
+        # disappear from the dashboard while quietly staying in
+        # "Calendars to monitor"/subscriptions/overrides forever - the
+        # same cleanup _cleanup_removed_calendar_entity already does
+        # when Home Assistant itself deletes the underlying entity,
+        # just triggered from this side instead. Only entities that
+        # were referenced in the OLD people[] and are gone from the
+        # NEW one count as "removed" - still being someone else's
+        # calendar (or still an extra on a different row) correctly
+        # leaves it alone.
+        if "people" in new_settings:
+            removed_calendar_entities = _calendar_entities_from_people(
+                existing.get("people")
+            ) - _calendar_entities_from_people(new_settings.get("people"))
+            if removed_calendar_entities:
+                cleanup_entry = _get_family_hub_entry(hass)
+                if cleanup_entry is not None:
+                    for removed_entity_id in sorted(removed_calendar_entities):
+                        await _cleanup_removed_calendar_entity(hass, cleanup_entry, entry_data, removed_entity_id)
     # also self-heal on every save, not just on load (see
     # _migrate_people_reminders_into_profiles's own docstring) - covers a
     # stale, not-yet-reloaded browser tab that still posts an old people[]
     # row's remindersEntity alongside an otherwise-current save.
     _migrate_people_reminders_into_profiles(new_settings)
+    _migrate_people_extra_calendars_into_profiles(new_settings)
     await store.async_save(new_settings)
     await _backup_settings(hass, new_settings)
+    await chores_ws_api.async_prune_locked_popups(entry_data, new_settings)
     connection.send_result(msg["id"], {"success": True})
+
+
+def _sync_subscribed_calendars_monitored(hass: HomeAssistant, new_profiles: dict[str, Any]) -> None:
+    """Household report: a person could subscribe to a calendar (Settings
+    > Users > that person > Calendars) without it ever being added to
+    "Calendars to monitor" (CONF_CALENDARS) under Settings > General -
+    those are two separate lists, and only CONF_CALENDARS is what
+    _run_poll/_build_upcoming_summary actually fetch events from. A
+    calendar in the first list but not the second shows up fine in the
+    person's own subscription picker, but its reminders/digest entries
+    silently never fire - exactly the mismatch the Users tab's own
+    Notification debug accordion flags per-person as "not monitored"
+    (see _build_user_notify_debug).
+
+    Rather than make the household remember to do both, this runs on
+    every family_hub/set_settings save that touches userProfiles (see
+    its own call site, right next to _sync_profile_wishlist_flags) and
+    auto-adds any newly-subscribed calendar.* entity, across every
+    profile in the save, straight into CONF_CALENDARS - same
+    "subscribing clearly means you want it to work" reasoning
+    _ws_set_notify_overrides already applies when a calendar gets a
+    notify target. Uses the same _add_monitored_calendars helper (never
+    removes anything - see its own docstring) and the same
+    config_entries.async_update_entry call shape as that handler.
+    """
+    entry = _get_family_hub_entry(hass)
+    if entry is None:
+        return
+    subscribed_entities: set[str] = set()
+    for profile in new_profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        calendars = profile.get("subscribedCalendars")
+        if not isinstance(calendars, list):
+            continue
+        for entity in calendars:
+            entity = str(entity).strip()
+            # Only real calendar entities belong in CONF_CALENDARS - a
+            # subscription list can't actually contain anything else
+            # today, but this guard is cheap and matches
+            # _ws_set_notify_overrides's own identical filter.
+            if entity.startswith("calendar."):
+                subscribed_entities.add(entity)
+    if not subscribed_entities:
+        return
+    existing = entry.options.get(CONF_CALENDARS, [])
+    updated = _add_monitored_calendars(existing, sorted(subscribed_entities))
+    if updated != existing:
+        hass.config_entries.async_update_entry(entry, options={**entry.options, CONF_CALENDARS: updated})
 
 
 async def _sync_profile_wishlist_flags(
@@ -3044,23 +3626,6 @@ async def _ws_remove_menu_suggestion(
 
 
 # ---------------------------------------------------------------------------
-# Calendar event deletion (v1.132.43+, )
-#
-# Two commands, deliberately split: family-week-calendar-card.js's own
-# _openEventInfo popup calls _ws_get_calendar_delete_support FIRST (as soon
-# as it needs to decide whether to draw a working Delete button or a greyed-
-# out one with an explanatory popup), then only ever calls
-# _ws_delete_calendar_event if that came back supported AND the household
-# member has PERMISSION_DELETE_EVENT. The support check is read-only
-# information (no permission gate - a kid's card is allowed to know delete
-# isn't possible here at all, same as anyone can see a Claim button without
-# having claimed anything); the actual delete is the one genuinely
-# consequential, backend-enforced action, mirroring _ws_apply_menu_
-# suggestion's "the browser can ask all it wants, only the server-side
-# permission check decides" shape for PERMISSION_EDIT_MENU above.
-# ---------------------------------------------------------------------------
-
-
 def _coerce_calendar_datetime(value: str, *, is_date_only: bool):
     """Turn one of the card's own ISO-ish strings into a real Python
     date/datetime object - CalendarEntity.async_create_event/
@@ -3097,6 +3662,35 @@ def _build_entity_event_fields(raw: dict) -> dict:
     if raw.get("rrule"):
         fields["rrule"] = raw["rrule"]
     return fields
+
+
+# Calendar event deletion (v1.132.43+, )
+#
+# Two commands, deliberately split: family-week-calendar-card.js's own
+# _openEventInfo popup calls _ws_get_calendar_delete_support FIRST (as soon
+# as it needs to decide whether to draw a working Delete button or a greyed-
+# out one with an explanatory popup), then only ever calls
+# _ws_delete_calendar_event if that came back supported AND the household
+# member has PERMISSION_DELETE_EVENT. The support check is read-only
+# information (no permission gate - a kid's card is allowed to know delete
+# isn't possible here at all, same as anyone can see a Claim button without
+# having claimed anything); the actual delete is the one genuinely
+# consequential, backend-enforced action, mirroring _ws_apply_menu_
+# suggestion's "the browser can ask all it wants, only the server-side
+# permission check decides" shape for PERMISSION_EDIT_MENU above.
+# ---------------------------------------------------------------------------
+
+
+@websocket_api.websocket_command({vol.Required("type"): "family_hub/calendar/colors"})
+@websocket_api.async_response
+async def _ws_get_calendar_colors(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """v1.168.75: {entity_id: "#rrggbb"} for every calendar that has a color
+    in Home Assistant (for Google calendars, Google's own color). Settings
+    uses it for a newly added calendar and for "Reset to calendar color".
+    Read-only, open to any member."""
+    connection.send_result(msg["id"], {"colors": _calendar_entity_colors(hass)})
 
 
 @websocket_api.websocket_command(
@@ -3164,6 +3758,17 @@ async def _ws_get_calendar_delete_support(
     # in the card's JS), so a second round trip would just be two
     # network calls doing the exact same lookup twice.
     update_supported = bool(supported_features & CALENDAR_ENTITY_FEATURE_UPDATE_EVENT)
+    # Same bit-check again, CREATE_EVENT this time - what the Add Event
+    # modal's own Repeat accordion (family-week-calendar-card.js) gates
+    # on, since a repeating event's `rrule` only ever reaches a calendar
+    # through CalendarEntity.async_create_event (see this file's own
+    # _ws_create_calendar_event and _build_entity_event_fields below) -
+    # never through the public create_event SERVICE a plain one-off
+    # event still uses. A platform that can create events at all but
+    # happens to ignore `rrule` would still report this bit true (HA
+    # core has no separate "supports recurrence specifically" bit), so
+    # this is the closest real signal available, not a perfect one.
+    create_supported = bool(supported_features & CALENDAR_ENTITY_FEATURE_CREATE_EVENT)
     integration_name = CALENDAR_PLATFORM_FRIENDLY_NAMES.get(platform) if platform else None
     if integration_name is None:
         integration_name = platform.replace("_", " ").title() if platform else "your calendar's own app"
@@ -3172,6 +3777,7 @@ async def _ws_get_calendar_delete_support(
         {
             "supported": supported,
             "update_supported": update_supported,
+            "create_supported": create_supported,
             "platform": platform,
             "integration_name": integration_name,
         },
@@ -3264,6 +3870,14 @@ async def _ws_delete_calendar_event(
         vol.Required("entity_id"): str,
         vol.Required("uid"): str,
         vol.Optional("recurrence_id"): vol.Any(str, None),
+        # "THISANDFUTURE" (ical's own Range.THIS_AND_FUTURE.value - see
+        # CalendarEntity.async_update_event's own recurrence_range param)
+        # or omitted/None for a single occurrence or the whole series,
+        # whichever recurrence_id on its own already means. Lets the
+        # Edit form's own this/future/all picker (family-week-calendar-
+        # card.js's _promptRecurrenceEditScope) reach the same three-way
+        # split Google Calendar's own edit dialog offers.
+        vol.Optional("recurrence_range"): vol.Any(str, None),
         vol.Required("event"): dict,
     }
 )
@@ -3308,7 +3922,12 @@ async def _ws_update_calendar_event(
         return
     try:
         event_fields = _build_entity_event_fields(raw_event_fields)
-        await entity.async_update_event(msg["uid"], event_fields, recurrence_id=msg.get("recurrence_id"))
+        await entity.async_update_event(
+            msg["uid"],
+            event_fields,
+            recurrence_id=msg.get("recurrence_id"),
+            recurrence_range=msg.get("recurrence_range"),
+        )
     except Exception as err:  # noqa: BLE001 - surfaced to the caller as-is, nothing here to recover
         _LOGGER.warning("Family Hub: failed to update calendar event on %s: %s", msg["entity_id"], err)
         connection.send_error(msg["id"], "unknown_error", f"Could not update this event: {err}")
@@ -5882,6 +6501,56 @@ def _extract_json_ld_recipe(html: str) -> dict | None:
     return None
 
 
+_RECIPE_URL_MAX_REDIRECTS = 5
+
+
+async def _recipe_url_block_reason(url: str, allow_private: bool) -> str | None:
+    """Why parse_recipe_url must refuse to fetch this URL, or None if it's fine.
+
+    parse_recipe_url runs on the Home Assistant server, so without this any
+    logged-in account (a kid's, the kiosk tablet's) could make HA request
+    addresses on the home network - the router admin page, another device's
+    local API - and learn from the error text which ones answer. Rules:
+      - only http/https, never file:, ftp:, etc.
+      - non-admins: no host that is, or resolves to, a loopback, private
+        (10/8, 172.16/12, 192.168/16, fc00::/7), link-local, or otherwise
+        non-public address.
+      - admins: anything http(s), since a household running its own recipe
+        server (Mealie, Tandoor, ...) on the LAN is a real use.
+    A hostname that doesn't resolve at all is let through: the fetch itself
+    then fails with the ordinary "Couldn't reach that page" message, and
+    there's nothing on the network it could have reached anyway.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "That doesn't look like a valid web address."
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return "Only http:// or https:// web addresses can be imported."
+    if allow_private:
+        return None
+    host = parts.hostname.strip("[]")
+    addresses: list[str] = []
+    try:
+        addresses = [str(ipaddress.ip_address(host))]
+    except ValueError:
+        if host.lower() == "localhost" or host.lower().endswith((".local", ".localhost", ".lan", ".home.arpa", ".internal")):
+            return "Importing from addresses on your home network needs a Home Assistant admin account."
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80))
+            addresses = [info[4][0] for info in infos]
+        except OSError:
+            return None
+    for addr in addresses:
+        try:
+            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+        except ValueError:
+            continue
+        if not ip.is_global:
+            return "Importing from addresses on your home network needs a Home Assistant admin account."
+    return None
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "family_hub/parse_recipe_url",
@@ -5903,18 +6572,39 @@ async def _ws_parse_recipe_url(
         connection.send_result(msg["id"], {"success": False, "error": "No URL given"})
         return
 
+    # v1.168.59: see _recipe_url_block_reason - only an admin may point
+    # this at the home network (e.g. a self-hosted recipe server); any
+    # other account is limited to public http(s) pages. Redirects are
+    # followed by hand so every hop gets the same check, rather than
+    # letting a public page bounce the request onto a local address.
+    user = getattr(connection, "user", None)
+    allow_private = bool(user is not None and getattr(user, "is_admin", False))
     session = async_get_clientsession(hass)
     try:
-        async with session.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; FamilyHub-RecipeImport/1.0)"},
-            timeout=aiohttp.ClientTimeout(total=15),
-            allow_redirects=True,
-        ) as resp:
-            if resp.status != 200:
-                connection.send_result(msg["id"], {"success": False, "error": f"That page returned HTTP {resp.status}"})
+        html = None
+        for _hop in range(_RECIPE_URL_MAX_REDIRECTS + 1):
+            block_reason = await _recipe_url_block_reason(url, allow_private)
+            if block_reason:
+                connection.send_result(msg["id"], {"success": False, "error": block_reason})
                 return
-            html = await resp.text(errors="ignore")
+            async with session.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; FamilyHub-RecipeImport/1.0)"},
+                timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=False,
+            ) as resp:
+                location = (getattr(resp, "headers", None) or {}).get("Location")
+                if resp.status in (301, 302, 303, 307, 308) and location:
+                    url = urljoin(url, location)
+                    continue
+                if resp.status != 200:
+                    connection.send_result(msg["id"], {"success": False, "error": f"That page returned HTTP {resp.status}"})
+                    return
+                html = await resp.text(errors="ignore")
+                break
+        if html is None:
+            connection.send_result(msg["id"], {"success": False, "error": "That page redirected too many times."})
+            return
     except Exception as err:  # noqa: BLE001 - any network failure becomes a friendly message
         connection.send_result(msg["id"], {"success": False, "error": f"Couldn't reach that page: {err}"})
         return
@@ -11391,6 +12081,72 @@ async def _async_register_chore_services(hass: HomeAssistant) -> None:
     hass.services.async_register(DOMAIN, SERVICE_REJECT_CHORE, _handle_reject_chore)
     hass.services.async_register(DOMAIN, SERVICE_NUDGE_USER, _handle_nudge_user)
 
+    # v1.168.74: timers from automations, scripts and voice.
+    async def _resolve_user(value: Any) -> str:
+        """A user id, or a person's name (case-insensitive) - "" if none."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            users = await hass.auth.async_get_users()
+        except Exception:  # noqa: BLE001
+            users = []
+        for u in users:
+            if u.id == text:
+                return u.id
+        for u in users:
+            if (u.name or "").strip().lower() == text.lower():
+                return u.id
+        _LOGGER.warning("Family Hub: no Home Assistant user called %r - starting the timer unassigned", text)
+        return ""
+
+    async def _handle_start_timer(call: ServiceCall) -> None:
+        entry_data = _get_family_hub_entry_data(hass)
+        if entry_data is None:
+            _LOGGER.warning("Family Hub: %s called but Family Hub isn't set up", SERVICE_START_TIMER)
+            return
+        minutes = float(call.data.get("minutes") or 0) + float(call.data.get("seconds") or 0) / 60 + float(call.data.get("hours") or 0) * 60
+        speakers = call.data.get("speakers") or []
+        if isinstance(speakers, str):
+            speakers = [speakers]
+        try:
+            await chores_ws_api.async_start_standalone_timer(
+                hass, entry_data,
+                minutes=minutes,
+                label=call.data.get("label"),
+                user_id=await _resolve_user(call.data.get("user")),
+                actor_id=getattr(call.context, "user_id", None),
+                alarm_audience=call.data.get("alarm_audience"),
+                alarm_device_ids=[str(x) for x in speakers],
+                source="automation",
+            )
+        except timer_engine.TimerError as err:
+            _LOGGER.warning("Family Hub: %s failed: %s", SERVICE_START_TIMER, err)
+
+    async def _handle_cancel_timer(call: ServiceCall) -> None:
+        entry_data = _get_family_hub_entry_data(hass)
+        if entry_data is None:
+            return
+        user_id = await _resolve_user(call.data.get("user")) if call.data.get("user") else None
+        await chores_ws_api.async_cancel_timer_by_service(
+            hass, entry_data, uid=call.data.get("uid"), user_id=user_id, title=call.data.get("label"),
+        )
+
+    async def _handle_stop_timer_alarm(call: ServiceCall) -> None:
+        entry_data = _get_family_hub_entry_data(hass)
+        if entry_data is None:
+            return
+        uid = call.data.get("uid")
+        uids = [uid] if uid else list(chores_ws_api._active_alarms(entry_data))
+        for one in uids:
+            await chores_ws_api.async_stop_alarm(
+                hass, entry_data, one, by_user_id=getattr(call.context, "user_id", None), via="automation",
+            )
+
+    hass.services.async_register(DOMAIN, SERVICE_START_TIMER, _handle_start_timer)
+    hass.services.async_register(DOMAIN, SERVICE_CANCEL_TIMER, _handle_cancel_timer)
+    hass.services.async_register(DOMAIN, SERVICE_STOP_TIMER_ALARM, _handle_stop_timer_alarm)
+
 
 # ---------------------------------------------------------------------------
 # Dashboard resource auto-registration (best-effort)
@@ -11488,6 +12244,129 @@ def _register_dashboard_resource(hass: HomeAssistant, versioned_url: str) -> Non
 
 
 # ---------------------------------------------------------------------------
+# v1.168.66: retire the My Chores card
+# ---------------------------------------------------------------------------
+#
+# Household ask: "depreciate my chores and add a just me picker ... make it
+# so any current dashboards with my chores switches over to chores set as
+# just me." The Chores card's "People on this card" option now accepts
+# "me" (whoever is signed in), so a My Chores card becomes a Chores card
+# showing just me + the Chore Bin. On every startup, every saved (UI-edited)
+# dashboard is checked and any My Chores card in it is rewritten in place;
+# nothing is saved unless something changed, so this is a no-op once done.
+# YAML-mode dashboards can't be rewritten from here - the old card type
+# keeps working there as a thin wrapper around the Chores card (see
+# card/family-hub-my-chores-card.js, whose conversion must match this one).
+
+MY_CHORES_CARD_TYPE = "custom:family-hub-my-chores-card"
+CHORES_CARD_TYPE = "custom:family-hub-chores-card"
+
+
+def _my_chores_to_chores_config(card: dict) -> dict:
+    """Return the Chores card config that replaces one My Chores card."""
+    out = {key: value for key, value in card.items() if key != "type"}
+    out = {"type": CHORES_CARD_TYPE, **out}
+    out["title"] = card.get("title") or "My Chores"
+    out["people"] = ["me", "chore_bin"]
+    out["show_waiting_to_recur"] = False
+    return out
+
+
+def _replace_my_chores_cards(node: Any) -> tuple[Any, int]:
+    """Walk any dashboard config (views, sections, stacks, conditional
+    cards, pop-ups...) and swap every My Chores card. Returns the new node
+    and how many cards were replaced."""
+    if isinstance(node, dict):
+        if node.get("type") == MY_CHORES_CARD_TYPE:
+            return _my_chores_to_chores_config(node), 1
+        total = 0
+        out: dict = {}
+        for key, value in node.items():
+            new_value, count = _replace_my_chores_cards(value)
+            out[key] = new_value
+            total += count
+        return out, total
+    if isinstance(node, list):
+        total = 0
+        items = []
+        for value in node:
+            new_value, count = _replace_my_chores_cards(value)
+            items.append(new_value)
+            total += count
+        return items, total
+    return node, 0
+
+
+async def _migrate_my_chores_cards(hass: HomeAssistant) -> int:
+    """Rewrite My Chores cards on every saved dashboard. Best-effort: any
+    unexpected Home Assistant internals just skip that dashboard."""
+    lovelace_data = hass.data.get("lovelace")
+    dashboards = getattr(lovelace_data, "dashboards", None)
+    if dashboards is None and isinstance(lovelace_data, dict):
+        dashboards = lovelace_data.get("dashboards")
+    if not dashboards:
+        return 0
+    changed: list[str] = []
+    replaced_total = 0
+    for url_path, dashboard in list(dashboards.items()):
+        try:
+            if getattr(dashboard, "mode", None) != "storage":
+                continue
+            config = await dashboard.async_load(False)
+            if not isinstance(config, dict) or "strategy" in config:
+                continue
+            new_config, count = _replace_my_chores_cards(config)
+            if not count:
+                continue
+            await dashboard.async_save(new_config)
+            replaced_total += count
+            changed.append(str(url_path or "lovelace"))
+            _LOGGER.info(
+                "Family Hub: switched %s My Chores card(s) on dashboard %s to the Chores card (Just me)",
+                count,
+                url_path or "lovelace",
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Family Hub: My Chores migration skipped dashboard %s: %s", url_path, err)
+    if replaced_total:
+        try:
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "notification_id": "family_hub_my_chores_retired",
+                    "title": "Family Hub: My Chores is now part of Chores",
+                    "message": (
+                        f"{replaced_total} My Chores card(s) on your dashboards ({', '.join(changed)}) "
+                        "were switched to the Chores card set to \"Just me\" plus the Chore Bin - "
+                        "they show the same chores as before. Edit the card to change who it shows."
+                    ),
+                },
+                blocking=False,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Family Hub: could not post the My Chores notice: %s", err)
+    return replaced_total
+
+
+def _schedule_my_chores_migration(hass: HomeAssistant) -> None:
+    """Run the My Chores migration once Home Assistant has finished starting
+    (dashboards are loaded by then), or right away on a reload."""
+    async def _run(_hass: HomeAssistant | None = None) -> None:
+        try:
+            await _migrate_my_chores_cards(hass)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Family Hub: My Chores migration failed: %s", err)
+
+    try:
+        from homeassistant.helpers.start import async_at_started
+
+        async_at_started(hass, _run)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Family Hub: could not schedule the My Chores migration: %s", err)
+
+
+# ---------------------------------------------------------------------------
 # Integration setup / teardown
 # ---------------------------------------------------------------------------
 
@@ -11580,9 +12459,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     websocket_api.async_register_command(hass, _ws_apply_menu_suggestion)
     websocket_api.async_register_command(hass, _ws_remove_menu_suggestion)
     websocket_api.async_register_command(hass, _ws_get_calendar_delete_support)
+    websocket_api.async_register_command(hass, _ws_get_calendar_colors)
+    websocket_api.async_register_command(hass, _ws_create_calendar_event)
     websocket_api.async_register_command(hass, _ws_delete_calendar_event)
     websocket_api.async_register_command(hass, _ws_update_calendar_event)
-    websocket_api.async_register_command(hass, _ws_create_calendar_event)
     websocket_api.async_register_command(hass, _ws_list_users)
     websocket_api.async_register_command(hass, _ws_detect_notify_target)
     websocket_api.async_register_command(hass, _ws_get_recipes)
@@ -11647,6 +12527,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # family_hub/get_recipes|set_recipes and get_suggestions|set_suggestions
     # commands the calendar card's own Recipe Box modal already uses.
     recipe_box_card_path = f"{integration_dir}/card/family-hub-recipe-box-card.js"
+    # the standalone Right Now card (see family-right-now-card.js's
+    # own module docstring / const.py's RIGHT_NOW_CARD_JS_URL comment).
+    # Same four-step pattern as every card above.
+    right_now_card_path = f"{integration_dir}/card/family-right-now-card.js"
     icon_path = f"{integration_dir}/icon.png"
 
     static_paths = [
@@ -11663,6 +12547,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         StaticPathConfig(TODO_CARD_JS_URL, todo_card_path, False),
         StaticPathConfig(ACTIVE_TIMERS_CARD_JS_URL, active_timers_card_path, False),
         StaticPathConfig(RECIPE_BOX_CARD_JS_URL, recipe_box_card_path, False),
+        StaticPathConfig(RIGHT_NOW_CARD_JS_URL, right_now_card_path, False),
     ]
     icon_exists = await hass.async_add_executor_job(os.path.isfile, icon_path)
     if icon_exists:
@@ -11685,6 +12570,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     todo_card_hash = await hass.async_add_executor_job(_file_content_hash, todo_card_path)
     active_timers_card_hash = await hass.async_add_executor_job(_file_content_hash, active_timers_card_path)
     recipe_box_card_hash = await hass.async_add_executor_job(_file_content_hash, recipe_box_card_path)
+    right_now_card_hash = await hass.async_add_executor_job(_file_content_hash, right_now_card_path)
     panel_url_versioned = f"{PANEL_JS_URL}?v={panel_hash}"
     card_url_versioned = f"{CARD_JS_URL}?v={card_hash}"
     theme_selector_url_versioned = f"{THEME_SELECTOR_CARD_JS_URL}?v={theme_selector_hash}"
@@ -11698,6 +12584,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     todo_card_url_versioned = f"{TODO_CARD_JS_URL}?v={todo_card_hash}"
     active_timers_card_url_versioned = f"{ACTIVE_TIMERS_CARD_JS_URL}?v={active_timers_card_hash}"
     recipe_box_card_url_versioned = f"{RECIPE_BOX_CARD_JS_URL}?v={recipe_box_card_hash}"
+    right_now_card_url_versioned = f"{RIGHT_NOW_CARD_JS_URL}?v={right_now_card_hash}"
     icon_url_versioned = ""
     if icon_exists:
         icon_hash = await hass.async_add_executor_job(_file_content_hash, icon_path)
@@ -11732,6 +12619,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _register_dashboard_resource(hass, todo_card_url_versioned)
     _register_dashboard_resource(hass, active_timers_card_url_versioned)
     _register_dashboard_resource(hass, recipe_box_card_url_versioned)
+    _register_dashboard_resource(hass, right_now_card_url_versioned)
+    _schedule_my_chores_migration(hass)
 
     themes = await _load_themes(hass)
     _register_ha_themes(hass, themes)
@@ -11779,7 +12668,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # and marking it migrated - which would make this store look non-empty
     # by the time anything else could restore it. See its docstring.
     await _maybe_restore_settings_backup(hass, settings_store)
+    # Must run right after the restore above and before anything else
+    # writes to the store - an empty store here is the one reliable sign
+    # of a brand-new install. See its docstring.
+    await _pin_default_global_theme(hass, settings_store)
     await _migrate_notify_profiles(hass, entry, settings_store)
+    # One-time catch-up for households that already had a calendar
+    # subscribed-but-not-monitored before this version - everything
+    # saved going forward self-heals via _sync_subscribed_calendars_
+    # monitored's own call site in _ws_set_settings, but that only
+    # fires on the NEXT Settings save, which could be a while for a
+    # profile nobody's touched since setting it up. Cheap and
+    # idempotent - _add_monitored_calendars is a no-op once everything
+    # subscribed is already in CONF_CALENDARS, so this costs nothing on
+    # every later restart either.
+    _startup_settings = await settings_store.async_load()
+    if isinstance(_startup_settings, dict):
+        _startup_profiles = _get_user_profiles(_startup_settings)
+        if _startup_profiles:
+            _sync_subscribed_calendars_monitored(hass, _startup_profiles)
 
     recipes_store: Store = Store(
         hass, RECIPES_STORAGE_VERSION, f"{RECIPES_STORAGE_KEY_PREFIX}_{entry.entry_id}"
@@ -11891,6 +12798,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # (both share the same "already set" guard). See this function's own
     # docstring for the full picture.
     await _maybe_seed_settings_from_setup_wizard(hass, entry, settings_store)
+    await _maybe_seed_calendar_rows_from_setup_wizard(hass, entry, settings_store)
     # Must run after both userProfiles (in settings_store) and permissions
     # (just loaded above) exist, so an existing household's "everyone
     # already visible" state can be backfilled into the new opt-in
@@ -12004,7 +12912,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as err:  # noqa: BLE001 - a snapshot failure must never kill the schedule
             _LOGGER.warning("Family Hub: settings history snapshot failed: %s", err)
 
-    cancel_settings_history = async_track_time_change(hass, _snapshot_settings_history, minute=0, second=0)
+    # Every 12 hours (00:00 and 12:00), not hourly - household ask,
+    # verbatim: "extend number of backups to 8, taken every 12 hours."
+    # Still wall-clock-aligned (hour=[0, 12], minute=0, second=0), same
+    # reasoning as the comment just above - this just widens the
+    # interval, it doesn't change the alignment.
+    cancel_settings_history = async_track_time_change(
+        hass, _snapshot_settings_history, hour=[0, 12], minute=0, second=0
+    )
 
     # "this should use the home assistant native timer.*". When a
     # Family Hub timer is running on an adopted native timer helper, HOME
@@ -12026,11 +12941,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     cancel_timer_finished = hass.bus.async_listen(NATIVE_TIMER_EVENT_FINISHED, _on_native_timer_event)
     cancel_timer_cancelled = hass.bus.async_listen(NATIVE_TIMER_EVENT_CANCELLED, _on_native_timer_event)
 
+    # v1.168.74: the Stop button on a timer alarm phone notification.
+    async def _on_mobile_action(event) -> None:
+        try:
+            await chores_ws_api.handle_mobile_notification_action(hass, event)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Family Hub: alarm Stop from a phone failed: %s", err)
+
+    cancel_alarm_phone_action = hass.bus.async_listen("mobile_app_notification_action", _on_mobile_action)
+
     hass.data[DOMAIN]["entries"][entry.entry_id] = {
         "cancel": cancel,
         "cancel_timer_sweep": cancel_timer_sweep,
         "cancel_timer_finished": cancel_timer_finished,
         "cancel_timer_cancelled": cancel_timer_cancelled,
+        "cancel_alarm_phone_action": cancel_alarm_phone_action,
+        # v1.168.74: the timer log (see chores_websocket_api.async_load_timer_log)
+        "timer_log_store": Store(hass, 1, f"family_hub_timer_log_{entry.entry_id}"),
         "notified": notified,
         "reminders_store": reminders_store,
         "reminder_overrides": reminder_overrides,
@@ -12042,6 +12969,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "digest_store": digest_store,
         "digest_state": digest_state,
         "settings_store": settings_store,
+        # v1.168.71: kiosk PIN hashes and locked More-menu pop-up contents,
+        # each in its own Store that family_hub/get_settings never returns
+        "pins_store": Store(hass, 1, f"family_hub_kiosk_pins_{entry.entry_id}"),
+        "locked_popups_store": Store(hass, 1, f"family_hub_locked_popups_{entry.entry_id}"),
         "recipes_store": recipes_store,
         "suggestions_store": suggestions_store,
         "todo_card_config_store": todo_card_config_store,
@@ -12069,6 +13000,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "settings_history_store": settings_history_store_obj,
         "cancel_settings_history": cancel_settings_history,
     }
+
+    # v1.168.74: every stored timer fires on its exact second again after a
+    # restart (the sweep is only the backstop).
+    for _running in list((timers_state or {}).get("timers") or []):
+        chores_ws_api.schedule_timer(hass, hass.data[DOMAIN]["entries"][entry.entry_id], _running)
+
+    # Registered once per Home Assistant run, not once per config entry -
+    # register_view adds a route to the shared aiohttp app, and Family
+    # Hub only ever has one config entry in practice anyway, but a second
+    # async_setup_entry call (another entry, or this one reloading) must
+    # never try to add the same route twice.
+    if not hass.data[DOMAIN].get("_settings_history_export_view_registered"):
+        hass.http.register_view(FamilyHubSettingsHistoryExportView())
+        hass.data[DOMAIN]["_settings_history_export_view_registered"] = True
 
     # Root cause: v186 added the
     # family_hub_routine_event bus event (see chores_websocket_api.py's
@@ -12117,6 +13062,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
+    async def _on_entity_registry_removed(event) -> None:
+        action = event.data.get("action")
+        if action == "remove":
+            entity_id = event.data.get("entity_id")
+            if isinstance(entity_id, str) and entity_id.startswith("calendar."):
+                await _cleanup_removed_calendar_entity(
+                    hass, entry, hass.data[DOMAIN]["entries"][entry.entry_id], entity_id
+                )
+            return
+        if action == "update":
+            # A rename shows up here as action=="update" with
+            # old_entity_id present (it's absent for a plain attribute/
+            # name change that didn't touch the entity_id itself - see
+            # _handle_renamed_calendar_entity's own docstring).
+            new_entity_id = event.data.get("entity_id")
+            old_entity_id = event.data.get("old_entity_id")
+            if (
+                isinstance(new_entity_id, str)
+                and isinstance(old_entity_id, str)
+                and new_entity_id != old_entity_id
+                and new_entity_id.startswith("calendar.")
+            ):
+                await _handle_renamed_calendar_entity(
+                    hass, entry, hass.data[DOMAIN]["entries"][entry.entry_id], old_entity_id, new_entity_id
+                )
+
+    entry.async_on_unload(hass.bus.async_listen("entity_registry_updated", _on_entity_registry_removed))
+
     # Run once shortly after setup/restart rather than waiting a full poll
     # interval before the first reminder check.
     hass.async_create_task(_poll())
@@ -12151,9 +13124,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry_data["cancel_settings_history"]()
     # the two native timer.* bus listeners need their own
     # unsubscribes, or they keep firing against a torn-down entry.
-    for key in ("cancel_timer_finished", "cancel_timer_cancelled"):
+    for key in ("cancel_timer_finished", "cancel_timer_cancelled", "cancel_alarm_phone_action"):
         if entry_data and entry_data.get(key):
             entry_data[key]()
+    # v1.168.74: per-timer exact-second schedules
+    for unsub in list(((entry_data or {}).get("timer_unsubs") or {}).values()):
+        try:
+            unsub()
+        except Exception:  # noqa: BLE001
+            pass
     if entry_data and entry_data.get("cancel_chore_sensor_listener"):
         entry_data["cancel_chore_sensor_listener"]()
 
