@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="#installation">Installation</a> · <a href="#a-look-around">Screenshots</a> · <a href="#features">Features</a> · <a href="#themes">Themes</a> · <a href="DOCUMENTATION.md">Documentation</a> · <a href="CHANGELOG.md">Changelog</a>
+  <a href="#installation">Installation</a> · <a href="#a-look-around">Screenshots</a> · <a href="#features">Features</a> · <a href="#themes">Themes</a> · <a href="https://jvarhol.github.io/HA-Family-Hub/">Documentation</a> · <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
