@@ -13230,9 +13230,26 @@ if (this._root.querySelector(".debug-overlay.open")) this._renderDebug();
 // so it never changes between one event-info popup and the next for the
 // same person's calendar. Cached per entity_id for the life of the card
 // rather than re-fetched every time _openEventInfo is opened.
+// v1.168.84: household report - "the recurring feature is gone from the
+// new event modal". Answers used to be cached for the whole page session,
+// including failed lookups and answers given while Home Assistant was
+// still starting (the calendar has no state yet, so everything reads as
+// "not supported"). A wall tablet that stayed open through an HA restart
+// then lost Repeat, the edit pencils and Edit until the page was
+// reloaded. Now only real answers are cached, and only for 10 minutes.
+// lets the edit pencils ask again about a calendar whose answer wasn't
+// real yet - after 30 s, so a still-starting Home Assistant isn't asked
+// in a tight loop.
+_retryCalendarSupportLater(entityId) {
+if (!this._pencilSupportAttempted || !this._pencilSupportAttempted.has(entityId)) return;
+setTimeout(() => {
+if (this._pencilSupportAttempted) this._pencilSupportAttempted.delete(entityId);
+}, 30000);
+}
 async _getCalendarDeleteSupport(entityId) {
 if (!this._calendarDeleteSupport) this._calendarDeleteSupport = {};
-if (this._calendarDeleteSupport[entityId]) return this._calendarDeleteSupport[entityId];
+const cached = this._calendarDeleteSupport[entityId];
+if (cached && Date.now() - (cached._at || 0) < 10 * 60 * 1000) return cached;
 if (!this._hass) return { supported: false, updateSupported: false, createSupported: false, integrationName: "your calendar's own app" };
 let result;
 try {
@@ -13250,13 +13267,23 @@ integrationName: res.integration_name || "your calendar's own app",
 // event-info read-only note act on a REAL "this calendar can't take
 // changes" answer, never on a missing field or a failed round trip
 // (both of which still fall back to the cautious defaults above).
-known: !!res && Object.prototype.hasOwnProperty.call(res, "create_supported"),
+known: !!res && Object.prototype.hasOwnProperty.call(res, "create_supported") && !res.unavailable,
+_at: Date.now(),
 };
+if (res && res.unavailable) {
+// not a real answer yet - don't remember it (see above)
+this._retryCalendarSupportLater(entityId);
+delete this._calendarDeleteSupport[entityId];
+return result;
+}
 } catch (e) {
 // An older backend (or a transient failure) means "assume unsupported"
 // - never silently offer a Delete/Edit button (or the Add Event modal's
 // own Repeat accordion) that might not actually work.
-result = { supported: false, updateSupported: false, createSupported: false, integrationName: "your calendar's own app" };
+// Not cached (v1.168.84): a dropped connection mid-restart shouldn't
+// hide Repeat/Edit until the page is reloaded - the next open asks again.
+this._retryCalendarSupportLater(entityId);
+return { supported: false, updateSupported: false, createSupported: false, integrationName: "your calendar's own app" };
 }
 this._calendarDeleteSupport[entityId] = result;
 return result;
@@ -28669,8 +28696,15 @@ const support = await this._getCalendarDeleteSupport(entity);
 // again) by the time this round trip resolves - re-read the select's
 // current value rather than trusting the one captured above.
 if (root.querySelector(".add-event-calendar-select").value !== entity) return;
-field.style.display = support.createSupported ? "" : "none";
-if (!support.createSupported) {
+// v1.168.84: hidden only when Home Assistant actually says this calendar
+// can't take new events. A lookup that failed or came back before the
+// calendar finished loading used to hide Repeat too - and, being cached,
+// kept it hidden on every calendar (Local Calendar included) until the
+// page was reloaded. If a calendar really can't store a repeating event,
+// saving it says so.
+const canRepeat = support.createSupported || !support.known;
+field.style.display = canRepeat ? "" : "none";
+if (!canRepeat) {
 root.querySelectorAll(".add-event-recur-freq-btn").forEach((b) => b.classList.toggle("active", b.dataset.value === "none"));
 this._updateAddEventRecurVisibility();
 }

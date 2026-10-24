@@ -3632,13 +3632,22 @@ def _coerce_calendar_datetime(value: str, *, is_date_only: bool):
     async_update_event (unlike the old public create_event SERVICE, which
     did this coercion itself via voluptuous's cv.date/cv.datetime) expect
     an actual date/datetime object under "dtstart"/"dtend", not a string.
-    Naive (no tzinfo) is correct here - each platform's own entity method
-    attaches whatever timezone it needs itself (see google/calendar.py's
-    own async_create_event, which wraps a naive datetime in its own
-    DateOrDatetime using hass.config.time_zone)."""
+    A timed value without a time zone gets Home Assistant's configured
+    one (see below)."""
     if is_date_only:
         return date.fromisoformat(value)
-    return datetime.fromisoformat(value.replace(" ", "T", 1))
+    parsed = datetime.fromisoformat(value.replace(" ", "T", 1))
+    # v1.168.84: give a timed event Home Assistant's own time zone, the
+    # same as HA's own calendar service and frontend do. Local Calendar
+    # stored a naive time as a "floating" event, and a repeating floating
+    # event with an end date (UNTIL, which the card sends in UTC as the
+    # iCalendar spec requires for a zoned start) was rejected - so
+    # repeating events with an end date couldn't be saved there.
+    if parsed.tzinfo is None:
+        get_tz = getattr(dt_util, "get_default_time_zone", None)
+        tz = get_tz() if get_tz else dt_util.DEFAULT_TIME_ZONE
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed
 
 
 def _build_entity_event_fields(raw: dict) -> dict:
@@ -3780,6 +3789,13 @@ async def _ws_get_calendar_delete_support(
             "create_supported": create_supported,
             "platform": platform,
             "integration_name": integration_name,
+            # v1.168.84: while Home Assistant is still starting (or the
+            # calendar's integration is reloading) the entity has no state
+            # yet, so supported_features reads as 0 and everything above
+            # comes out False. Flag it so the card treats the answer as
+            # "don't know yet" and asks again, instead of deciding the
+            # calendar can't repeat/edit events for the rest of the day.
+            "unavailable": state is None or state.state == "unavailable",
         },
     )
 
