@@ -50,7 +50,7 @@ cards (a sections/grid layout, or cards placed side-by-side), so the
 button sits under the card it actually belongs to instead of floating off
 in a screen corner that may not even be near it.
 
-## Chores, Rewards, Goals & My Chores cards
+## Chores, Rewards & Goals cards
 
 None of these need a `people`/entity list or any `todo`/`calendar` entities at all. Everything runs over Family Hub's own backend, and who's eligible is drawn from the members you've added under the calendar card's own Settings → Users tab. `title` is optional on all of them;
 Chores/Rewards/Goals also each take an optional `fab_position` (v1.110.7+,
@@ -74,10 +74,42 @@ title: Goals
 fab_position: dashboard # or "card" - see below
 ```
 
-`family-hub-my-chores-card` is a smaller, single-person companion (handy
-on a kid's own tablet/dashboard) showing just their own chores, goals, and
-routines rather than the full multi-column board. It has no "+" FAB of
-its own, so `fab_position` doesn't apply to it.
+**Who's on the card** (Chores and Rewards, v1.168.63+): by default every household member gets a column (Chores) or a balance (Rewards), plus a name pill across the top. To make a card for just some people (say, only the kids), tick them under **People on this card** in the card's visual editor, or list their Home Assistant user IDs in YAML. On the Chores card, `chore_bin` adds the Chore Bin column. Leave the list empty to show everyone.
+
+**Just me** (v1.168.66+): pick **Just me (whoever is signed in)** in the same list, or use `me` in YAML, for a personal card that shows whoever is signed in. On a kiosk it follows whoever logs in with their PIN. This replaces the old My Chores card:
+
+```yaml
+type: custom:family-hub-chores-card
+title: My Chores
+people:
+  - me
+  - chore_bin
+show_waiting_to_recur: false
+```
+
+```yaml
+type: custom:family-hub-rewards-card
+title: My Stars
+people:
+  - me
+```
+
+```yaml
+type: custom:family-hub-chores-card
+title: Kids' chores
+people:
+  - 0a1b2c3d4e5f... # Emma's Home Assistant user ID
+  - 9f8e7d6c5b4a... # Leo's
+  - chore_bin
+show_waiting_to_recur: true # Chores only: false hides the Waiting to Recur pill and column
+```
+
+| Option | Cards | Default | Description |
+|---|---|---|---|
+| `people` | Chores, Rewards | `[]` (everyone) | Which members appear on this card: Home Assistant user IDs, `me` (whoever is signed in) and, on Chores, `chore_bin`. If none of the listed people exist any more, the card shows everyone instead of going blank (except with `me`, which never shows everyone). On Rewards, goals, suggestions, pending rewards and history follow the same choice; the reward catalog always shows in full. |
+| `show_waiting_to_recur` | Chores | `true` | Show the **Waiting to Recur** pill and column (approved recurring chores waiting for their next due date). |
+
+**My Chores** (`family-hub-my-chores-card`) is deprecated since v1.168.66: use the Chores card with `people: [me, chore_bin]` instead (see below). Existing My Chores cards keep working and are switched over automatically on dashboards edited in the UI.
 
 **`fab_position`** (`dashboard` default | `card`, v1.110.7+, also
 available from each card's own visual editor as "+ button position"):
@@ -93,6 +125,68 @@ shared stacking slot (it's no longer sharing the screen corner with
 anything), though it stays a member of the same coordinator for Goal-tab
 de-duplication purposes (Chores/Rewards' own embedded Goal tab still
 correctly suppresses the standalone Goals card's FAB either way).
+
+## Family Today card
+
+A small single-day companion: today's events, meals and reminders, for a phone or a corner of any dashboard. It reads the household's calendars and colors from Family Hub's own settings, so it needs no `people` list.
+
+```yaml
+type: custom:family-today-card
+title: Today
+layout: sectioned # or "compact"
+show_add_button: false
+calendar_dashboard_path: /lovelace-family/0
+```
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `title` | no | `Today` | Card title. |
+| `layout` | no | `sectioned` | `sectioned` shows three labeled lists (Events / Meals / Due today); `compact` mixes them into one list by time, like Month view's day panel. |
+| `show_add_button` | no | `false` | Show an **Add** button for new events and reminders. |
+| `calendar_dashboard_path` | no | — | A relative dashboard path (e.g. `/lovelace-family/0`). When set, the card shows a button that opens the full calendar there. |
+| `calendar_button_label` | no | — | The label for that button. |
+| `weather_entity` | no | `weather.forecast_home` | Weather shown next to the date. |
+| `meal_plan_entity`, `reminders_entity` | no | the calendar card's | Only needed if you use different lists from the calendar card. |
+| `theme_override` | no | device theme | Pin this card to one theme. |
+
+<img src="/HA-Family-Hub/img/screenshots/today-card.webp" alt="The Family Today card" width="360" />
+
+## Right Now card
+
+The [Right Now bar](/docs/features/calendar-and-layout#the-right-now-bar) as a card of its own: the time and weather, then a tile per person with Home/Away, what they're doing now (and until when), and what's next.
+
+```yaml
+type: custom:family-right-now-card
+title: Right Now
+weather_entity: weather.forecast_home
+```
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `title` | no | `Right Now` | Card title. Left as `Right Now` (or empty) it's translated into your Home Assistant language. |
+| `people_entities` | no | everyone | A list of `calendar.*` entities: only those people/calendars get a tile (pick them in the visual editor). |
+| `weather_entity` | no | `weather.forecast_home` | Weather shown in the header: the current temperature and today's high/low. |
+| `show_clock`, `show_weather` | no | `true` | Turn the clock or the weather off. |
+| `calendar_dashboard_path`, `calendar_button_label` | no | — | Same as the Family Today card: a button that opens the full calendar. |
+| `theme_override` | no | device theme | Pin this card to one theme. |
+
+Home/Away comes from each person's presence entity and the extra pills (like a phone battery) from their sensors, both set in Settings → Users → their profile → **Presence & sensors**.
+
+![The Right Now card](/img/screenshots/right-now-card.webp)
+
+## Active Timers and My Pantry cards
+
+Both take only an optional `title` (and `theme_override`). See [Timers](/docs/features/timers) and [Grocy Integration](/docs/features/grocy-integration).
+
+```yaml
+type: custom:family-hub-active-timers-card
+title: Active Timers
+```
+
+```yaml
+type: custom:family-hub-pantry-card
+title: My Pantry
+```
 
 ## To-Do Lists card
 
@@ -137,3 +231,5 @@ Same household-wide Recipe Box data, same behavior. It runs on the exact same sh
 type: custom:family-hub-recipe-box-card
 title: Recipe Box
 ```
+
+![The Recipe Box card](/img/screenshots/recipe-box.webp)

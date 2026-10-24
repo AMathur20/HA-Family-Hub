@@ -29,6 +29,9 @@ features described in its own section below.
   editor), and a picker to reuse a loved dish when planning a new meal.
   Dishes can be added, edited, and deleted from the Loved Dishes list and
   each dish's own detail screen.
+
+![The Recipe Box, with category filters](/img/screenshots/recipe-box.webp)
+
 - **Recipe Box card** (v1.110.6+): the same Recipe Box as its own dashboard
   tab/card (`family-hub-recipe-box-card.js`), for anyone who'd rather have it
   pinned open than pop it up from the calendar. Browse, search, filter by

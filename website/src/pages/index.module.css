@@ -22,3 +22,45 @@
     padding: 2rem;
   }
 }
+
+.shots {
+  padding: 2.5rem 0 0.5rem;
+}
+
+.shots figure {
+  margin: 0;
+}
+
+.shots img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+}
+
+.shots figcaption {
+  text-align: center;
+  font-size: 0.9rem;
+  opacity: 0.75;
+  margin-top: 0.6rem;
+}
+
+.heroShot {
+  max-width: 1100px;
+  margin: 0 auto 2rem !important;
+}
+
+.shotRow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+@media screen and (max-width: 720px) {
+  .shotRow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

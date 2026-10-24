@@ -13,15 +13,22 @@ For years, the idea was a nagging itch: put a digital calendar on the wall. Noth
 
 Commercial smart displays like Skylight solve the display problem. They don't solve the price or the lock-in: often around $300 for an Android tablet running closed-source software you can't modify or extend, with no idea your lights, thermostat, or anything else in your home even exists. Paying that much for something you can't tinker with didn't make sense when Home Assistant was already running the rest of the house.
 
-Family Hub is the Home Assistant-native answer: an **11-card ecosystem** built from the ground up for Home Assistant, modular and fully configurable, deployable across wall tablets, desktops, and phones. It's built to compete with commercial family-hub tablets (Skylight, Dragon Touch, Cozyla, Nori, and similar) while running entirely on infrastructure you already own and control.
+Family Hub is the Home Assistant-native answer: a **12-card ecosystem** built from the ground up for Home Assistant, modular and fully configurable, deployable across wall tablets, desktops, and phones. It's built to compete with commercial family-hub tablets (Skylight, Dragon Touch, Cozyla, Nori, and similar) while running entirely on infrastructure you already own and control.
+
+![The Family Week Calendar in Week view, with meals, weather and colored person pills](/img/screenshots/calendar-week.webp)
+
+*The Family Week Calendar on a 1280×800 wall tablet (demo household, made-up data).*
 
 ## What's included
 
 - **Family Week Calendar**: the centerpiece, a full-screen, tablet-friendly Week/Month calendar with per-day meal planning, a recipe box, weather, a countdown banner, and a Daily Digest.
 - **Family Today**: a small single-day companion card for any dashboard, sharing the main card's config automatically.
+- **Right Now**: who's home, what everyone is doing right now, and what's next. Use it as its own card, or turn it on as a bar across the top (or down the side) of the calendar.
 - **Chores, Rewards, Goals & Routines**: assignable/rotating/first-come chores with a star economy, a redeemable rewards catalog, one-off goals, and Morning/Afternoon/Night routine checklists.
 - **To-Do Lists, Recipe Box & Pantry**: native Home Assistant to-do integration, a searchable recipe box, and pantry/grocery tracking via an optional [Grocy](https://grocy.info) connection.
 - **Active Timers & Screen Saver**: a household-wide timers board, plus an idle-triggered full-screen screen saver (video, camera feed, clock, weather, or photos).
+- **Your own buttons**: add pop-ups to the calendar's More menu with text, photos, links and QR codes (guest Wi-Fi, including UniFi's own QR code, contacts and more), optionally locked to chosen people.
+- **Themes and languages**: 10 built-in themes (including Liquid Glass and two that match Home Assistant's own look), a Theme Builder for your own, and translations into English, German, Spanish, French, Italian, Dutch, Polish and Portuguese (Brazil). See [Theming](/docs/features/theming-and-more).
 
 See [Calendar & Layout](/docs/features/calendar-and-layout) and the rest of the Features section in the sidebar for the full list, or jump straight to [Installation](/docs/installation).
 

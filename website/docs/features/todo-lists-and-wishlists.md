@@ -7,6 +7,9 @@ The **To-Do Lists card** (`family-hub-todo-card`) is a separate, optional card: 
 
 ## Multiple lists as columns
 
+![Two to-do lists side by side](/img/screenshots/todo-lists.webp)
+
+
 Each list you add shows up as its own column: shopping lists, reminders lists, project lists, whatever `todo.*` entities you have. Pick which ones show (and in what order) from the card's own Settings (the small gear button above the **+** FAB), under the **Lists** tab (no YAML editing needed after the card is placed). The board layout is adjustable too: stack 1 to 4 rows of columns, and optionally turn on "Fit to screen" so everything scales to fit without scrolling.
 
 ## Drag and drop

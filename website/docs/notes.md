@@ -8,7 +8,7 @@ sidebar_position: 6
   back to the Google Font "Varela Round" (loaded automatically).
 - Data (events, recipes, meal plan, meal templates, suggestions, weather,
   countdown, reminders) is polled every 60 seconds while the card is
-  connected; the Chores/Rewards/Goals/My Chores/Routines board cards poll
+  connected; the Chores/Rewards/Goals/Routines board cards poll
   the same way. The backend poller (reminders, event alerts, chore due
   reminders, recurrence resets, Daily Digest) runs independently on its own
   schedule (default every 5 minutes).

@@ -7,7 +7,7 @@ Privacy Mode hides the calendar and reminders across every Family Hub dashboard 
 
 ## What it actually hides
 
-Turning Privacy Mode on blanks out calendar events and reminders: every day/week/month cell, the Agenda view, and the reminders list all render exactly like a genuinely empty day, rather than being covered up by a black panel or a "hidden" placeholder. Everything else on the calendar card (the grid itself, meal blocks, countdown, weather) stays visible as normal. Privacy Mode only affects the main calendar card. The standalone Chores, Rewards, My Pantry, My Chores, To-Do Lists, and Screen Saver cards are completely unaffected and keep working normally.
+Turning Privacy Mode on blanks out calendar events and reminders: every day/week/month cell, the Agenda view, and the reminders list all render exactly like a genuinely empty day, rather than being covered up by a black panel or a "hidden" placeholder. Everything else on the calendar card (the grid itself, meal blocks, countdown, weather) stays visible as normal. Privacy Mode only affects the main calendar card. The standalone Chores, Rewards, My Pantry, To-Do Lists, and Screen Saver cards are completely unaffected and keep working normally.
 
 A small locked pill appears over the card instead: "Privacy Mode is on - tap to unlock."
 
@@ -32,3 +32,7 @@ Two Home Assistant entities let Privacy Mode be driven from automations, voice c
 
 - **`switch.family_hub_privacy_mode`**: one per household. Turning it on or off this way needs no PIN at all, in either direction: an automation or a script call is already an authenticated Home Assistant action, a different trust boundary than an anonymous tap on a kiosk's lock screen, so the PIN gate deliberately only applies to the on-screen unlock flow.
 - **A "Participates in privacy mode" switch per device**, the same per-device opt-out described above, exposed as its own entity so it can be automated too (e.g., automatically flip a specific kiosk out of Privacy Mode during a scheduled event).
+
+## Discreet Mode
+
+A lighter option for when the calendar can stay up but the details shouldn't: **Discreet Mode** keeps every event's coloured tile and time in place but hides the event text, and shows people as "Person 1", "Person 2" and so on instead of their names. It applies to the calendar and the Right Now card on every screen, needs no PIN, and is switched on and off in Settings → **Developer tools** → **Discreet mode**.
