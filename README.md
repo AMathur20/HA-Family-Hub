@@ -8,45 +8,117 @@
 </p>
 
 <p align="center">
-  Family Hub is a Home Assistant custom integration that bundles a whole<br />
-  family-tablet dashboard (calendar, meal planning, chores, rewards,<br />
-  goals, routines, and more) into one install/update.<br />
-  Runs entirely on your own Home Assistant instance, no cloud required.
+  A whole family-tablet dashboard for Home Assistant: calendar, meal planning,<br />
+  chores, rewards, timers and more, in one install.<br />
+  Runs entirely on your own Home Assistant, no cloud or subscription.
 </p>
 
 <p align="center">
-  <a href="#installation">Installation</a> · <a href="#features">Features</a> · <a href="DOCUMENTATION.md">Documentation</a> · <a href="CHANGELOG.md">Changelog</a>
+  <a href="#installation">Installation</a> · <a href="#a-look-around">Screenshots</a> · <a href="#features">Features</a> · <a href="#themes">Themes</a> · <a href="DOCUMENTATION.md">Documentation</a> · <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/hero-liquid-glass.webp" alt="The Family Week Calendar card in the Liquid Glass theme: a week of family events in colour-coded columns, with meals planned at the top of each day" width="100%" />
+</p>
+
+## A look around
+
+### The family calendar
+
+A week of everyone's calendars side by side, with breakfast, lunch and dinner planned at the top of each day. Switch between Week, Month, Planner and Agenda layouts, and tap any event to see details, edit it, duplicate it or turn it into a countdown.
+
+<table>
+  <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/view-month.webp" alt="Month view in the HA Light theme" /><br /><sub><b>Month</b> (HA Light theme)</sub></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/view-planner.webp" alt="Planner view: one row per day, one column per person" /><br /><sub><b>Planner</b>: one row per day, one column per person</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/view-agenda.webp" alt="Agenda view in the Liquid Glass Dark theme" /><br /><sub><b>Agenda</b>: a simple list, great for a narrow screen (Liquid Glass Dark)</sub></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/view-event.webp" alt="An event pop-up with reminders, a checklist and meal options" /><br /><sub><b>Event details</b>: reminders, checklists, edit and duplicate (Midnight)</sub></td>
+  </tr>
+</table>
+
+### Right Now, at a glance
+
+Who's home, what everyone is doing right now and what's next, either as its own card or built into the top of the calendar.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/calendar-right-now.webp" alt="The calendar with the Right Now bar along the top showing each person's current event and Home/Away status" width="100%" />
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/card-rightnow.webp" alt="The Right Now card in the Liquid Glass Dark theme" width="100%" /><br />
+  <sub><b>Right Now card</b>: presence, battery and any other sensor per person (Liquid Glass Dark)</sub>
+</p>
+
+### Chores, rewards and lists
+
+<table>
+  <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/card-chores.webp" alt="The Chores board with a column per person" /><br /><sub><b>Chores</b>: a column per person, stars for every job, "Mark in progress"</sub></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/card-rewards.webp" alt="The Rewards card with star balances and a reward catalog" /><br /><sub><b>Rewards</b>: spend stars on rewards you set up (Blossom theme)</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/card-todo.webp" alt="The To-Do Lists card showing groceries and errands" /><br /><sub><b>To-Do lists</b>: any Home Assistant to-do list, side by side (Slate)</sub></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/more-menu-popup.webp" alt="A Guest Wi-Fi pop-up with a QR code" /><br /><sub><b>Your own buttons</b>: e.g. a Guest Wi-Fi QR code, babysitter info or emergency contacts</sub></td>
+  </tr>
+</table>
+
+### Today card and phones
+
+<table>
+  <tr>
+    <td width="40%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/card-today.webp" alt="The Today card in the HA Light theme" /><br /><sub><b>Today card</b>: today's events, meals and reminders, for any dashboard (HA Light)</sub></td>
+    <td width="60%"><img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/phone.webp" alt="The calendar on a phone in the Liquid Glass and HA Dark themes" /><br /><sub><b>On a phone</b>: the calendar stacks into one day at a time (Liquid Glass and HA Dark)</sub></td>
+  </tr>
+</table>
+
+## Themes
+
+Ten built-in themes, plus every theme you have installed in Home Assistant. Each screen can use its own theme, and the Theme Builder lets you make your own (colours, fonts, glass transparency and blur, background image).
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JVarhol/HA-Family-Hub/main/images/readme/themes.webp" alt="The week view in all ten built-in themes: Soft, Slate, Meadow, Blossom, VaultTek, Midnight, HA Light, HA Dark, Liquid Glass and Liquid Glass Dark" width="100%" />
 </p>
 
 ## Features
 
-&bull; **Family Week Calendar card:** a full-screen, tablet-friendly Lovelace card combining a Week/Month family calendar, a per-day meal planner, a recipe box, weather, a countdown banner, and a Daily Digest, driven by any number of `calendar.*` entities with per-person columns and colors, configurable entirely from the in-card Settings panel.
+**Calendar**
+- Week, Month, Planner and Agenda layouts, with a choice of how many days and rows to show.
+- Any number of Home Assistant calendars. Each person gets a colour, a main calendar, and as many extra calendars as you like merged into their column.
+- Add, edit, duplicate and delete events, including repeating events, on calendars that support it.
+- Event reminders, checklists, countdowns, multi-person events, weather on each day, and an option to grey out past events.
+- Holiday Backgrounds: your own or ready-made holiday photos behind a day, a week or the whole month.
 
-&bull; **Family Today card:** a small, single-day companion card for any dashboard: today's events, meals, and due reminders, sharing the full card's config, entities, and theme automatically.
+**Meals and recipes**
+- One to three meal blocks a day, recurring meals, whole-week templates, and suggestions from dishes you've made before.
+- A searchable Recipe Box with ratings, and optional [Grocy](https://grocy.info) integration: a recipe viewer with servings scaling, recipe import from a link or pasted text, shopping lists and pantry tracking.
 
-&bull; **Meal planning & Recipe Box:** 1–3 configurable meal blocks a day, recurring weekly meals, whole-week templates, a searchable Recipe Box with ratings, and meal suggestions. Works fully standalone, no outside service required.
+**Chores, rewards, goals and routines**
+- Assigned, rotating or first-come chores that earn stars, a rewards catalog to spend them on, goals, and morning/afternoon/night routines.
+- Per-person permissions, Child and Kiosk accounts, and a "Just me" view for each person.
 
-&bull; **Grocy integration (optional):** connect a self-hosted [Grocy](https://grocy.info) instance to unlock a live in-card Recipe Viewer with a servings scaler, a three-way recipe importer (link, pasted text, or blank form with ingredient matching), grocery-list pushes, shopping lists, and Expiring Soon / Low Stock tracking.
+**Right Now, Today and the More menu**
+- Right Now shows each person's current and next event, Home/Away, and any sensors or switches you choose.
+- Today shows today's events, meals and reminders in a small card.
+- Add your own buttons to the More menu: pop-ups with text, photos, links and QR codes (Wi-Fi, contacts, links and more, including your UniFi network's own Wi-Fi QR code). A pop-up can be locked so only chosen people can open it.
 
-&bull; **Chores, Rewards, Goals & Routines:** a second board covering assignable/rotating/first-come chores with a star economy, a redeemable rewards catalog, one-off goals, and Morning/Afternoon/Night routine checklists, all gated by a granular per-person permissions system.
+**Timers and alarms**
+- Timers and alarms that ring on screens, phones and speakers until someone stops them, a Timer log, and actions and events for your automations.
 
-&bull; **Timers & alarms:** countdown timers on chores and rewards, a household-wide Active Timers board, and TTS/notification alarms.
+**For a wall tablet**
+- Screen Saver with video, camera feed, photos, clock and weather.
+- Privacy Mode keeps events behind a PIN lock screen; Discreet Mode hides names and event text but keeps the colours and times.
+- Kiosk PIN sign-in, so a shared tablet knows who is using it.
 
-&bull; **Screen Saver:** an idle-triggered full-screen video, camera feed, or widget overlay (clock, weather, photos) for a wall-mounted tablet, shared across every Family Hub card on the dashboard.
-
-&bull; **Privacy Mode:** hide every calendar event and reminder behind a lock screen until someone with the right permission enters their kiosk PIN. Opt individual devices in or out so it only applies where you want it.
-
-&bull; **Holiday Backgrounds:** household-uploaded or predefined holiday photos as a per-day background, with an optional "Expand to full screen" for that day, the whole week, or the whole month, and an automatic tiebreaker when more than one is active at once.
-
-&bull; **Server-side notifications:** calendar-event reminders, standalone reminders, chore due-date reminders, and a once-a-day Daily Digest, all fired by the backend on a schedule so they arrive whether or not anyone has the dashboard open.
-
-&bull; **Theming:** built-in preset themes plus every installed native Home Assistant theme, a per-device Theme Selector card, and per-theme color/font customization.
-
-Also built in: multi-person events with color-blended columns, per-calendar badges, print/export view, word-wrapped event titles, an hourly timeline view, a countdown banner, and Kiosk accounts for shared wall-mounted tablets.
+**Also**
+- Notifications sent by Home Assistant itself, so they arrive whether or not a dashboard is open: event reminders, reminders, chore due dates and a Daily Digest.
+- Settings backups every 12 hours, which you can download and restore.
+- Available in English, German, Spanish, French, Italian, Dutch, Polish and Portuguese (Brazil). Each person sees their own Home Assistant language and 12/24-hour clock.
 
 ## Installation
 
-Requires a few Home Assistant `todo.*` entities (for the recipe box, meal plan, and reminders) and at least one `calendar.*` entity (see [Requirements](DOCUMENTATION.md#requirements) in the full docs).
+Requires a few Home Assistant `todo.*` entities (for the recipe box, meal plan and reminders) and at least one `calendar.*` entity. See [Requirements](DOCUMENTATION.md#requirements) in the full docs.
 
 ### Option A: HACS (recommended)
 
@@ -68,9 +140,11 @@ Family Hub isn't in the default HACS store yet, so add it as a custom repository
 
 ## Documentation
 
-Full feature detail, the complete `todo`/`calendar` entity requirements, example card YAML for every card, and known limitations all live in [DOCUMENTATION.md](DOCUMENTATION.md). Release history is in [CHANGELOG.md](CHANGELOG.md) (older entries in [CHANGELOG_ARCHIVE.md](CHANGELOG_ARCHIVE.md)).
+Full feature detail, the complete `todo`/`calendar` entity requirements, example card YAML for every card, and known limitations are in [DOCUMENTATION.md](DOCUMENTATION.md). Release history is in [CHANGELOG.md](CHANGELOG.md) (older entries in [CHANGELOG_ARCHIVE.md](CHANGELOG_ARCHIVE.md)).
 
-Built to compete with commercial family-hub tablets (Skylight, Dragon Touch, etc.) while running entirely on your own Home Assistant instance.
+Built to compete with commercial family-hub tablets (Skylight, Dragon Touch and others) while running entirely on your own Home Assistant.
+
+<sub>Screenshots show sample data.</sub>
 
 ## License
 
