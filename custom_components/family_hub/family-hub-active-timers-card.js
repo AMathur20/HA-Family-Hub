@@ -54,74 +54,6 @@
 // are copy-pasted rather than imported, matching this project's established
 // convention.
 
-// ---- Family Hub shared translation helper (v1.168.76) -------------------
-// __fhT(key, english, vars, mode) looks a string up in Home Assistant's
-// loaded "fh_ui" translations (translations/<language>.json → fh_ui.text.*)
-// and falls back to the English text written right here in the source.
-// vars fill %0%, %1%, ... placeholders. mode "h" escapes the translated
-// text (not the vars, which callers already prepared) for use inside HTML
-// markup or an attribute value. Identical copy in every Family Hub card and
-// in the Theme Builder panel - whichever loads first sets it up.
-// __fhSweep(root) re-translates markup that was drawn before the language
-// file finished loading (elements tagged data-fh-t / data-fh-title /
-// data-fh-placeholder / data-fh-aria / data-fh-alt), but only while they
-// still show the English original, so text a card later replaced with
-// something else is never overwritten.
-var __fhI18n = (window.__familyHubI18n = window.__familyHubI18n || { hass: null, fb: {}, loading: null, loaded: null });
-var __fhEsc = function (s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-};
-var __fhT = function (key, fb, vars, mode) {
-  var g = window.__familyHubI18n || __fhI18n;
-  if (g.fb[key] === undefined) g.fb[key] = fb;
-  var str = "";
-  try {
-    if (g.hass && typeof g.hass.localize === "function") str = g.hass.localize("component.family_hub.fh_ui." + key) || "";
-  } catch (e) {
-    str = "";
-  }
-  if (!str) str = fb;
-  if (mode === "h") str = __fhEsc(str);
-  if (vars) {
-    Object.keys(vars).forEach(function (k) {
-      var v = vars[k];
-      str = str.split("%" + k + "%").join(v === null || v === undefined ? "" : String(v));
-    });
-  }
-  return str;
-};
-var __fhUseHass = function (hass) {
-  if (hass && typeof hass.localize === "function") (window.__familyHubI18n || __fhI18n).hass = hass;
-};
-var __fhSweep = function (root) {
-  if (!root || typeof root.querySelectorAll !== "function") return;
-  var g = window.__familyHubI18n || __fhI18n;
-  root.querySelectorAll("[data-fh-t]").forEach(function (el) {
-    var key = el.getAttribute("data-fh-t");
-    var fb = g.fb[key];
-    if (fb === undefined) return;
-    var cur = (el.textContent || "").trim();
-    if (cur !== fb && cur !== el.__fhShown) return;
-    var next = __fhT(key, fb);
-    if (cur !== next) el.textContent = next;
-    el.__fhShown = next;
-  });
-  [["data-fh-title", "title"], ["data-fh-placeholder", "placeholder"], ["data-fh-aria", "aria-label"], ["data-fh-alt", "alt"]].forEach(function (pair) {
-    root.querySelectorAll("[" + pair[0] + "]").forEach(function (el) {
-      var key = el.getAttribute(pair[0]);
-      var fb = g.fb[key];
-      if (fb === undefined) return;
-      var cur = el.getAttribute(pair[1]);
-      var shownKey = "__fhShown_" + pair[1];
-      if (cur !== fb && cur !== el[shownKey]) return;
-      var next = __fhT(key, fb);
-      if (cur !== next) el.setAttribute(pair[1], next);
-      el[shownKey] = next;
-    });
-  });
-};
-// -------------------------------------------------------------------------
-
 const PALETTE = ["#a9c6c2", "#dba99c", "#d9bf7e", "#a8bd93", "#b9a7c9", "#cf8f6c", "#a89a83"];
 // Must match const.py's TIMER_PRESET_MINUTES. Chosen for the household-timer
 // use case: 5 is the nag/turn-taking timer, 15 and 30 cover most cooking and
@@ -159,38 +91,18 @@ const UNASSIGNED_COLOR = "#c9c2b3";
 // shadow root, so it keeps working even if whichever card first noticed
 // the alarm gets scrolled off-screen or unmounted afterward.
 if (!window.__familyHubTimerAlarm) {
-  // v1.168.74 (timer + alarm overhaul): the on-screen half of a Family Hub
-  // timer alarm - a full-screen "time's up" with a looping alarm sound that
-  // keeps going until someone taps Stop, shared by every Family Hub card on
-  // the page (one modal, one sound, appended to document.body).
-  //
-  // A screen rings when the backend's family_hub_timer_alarm_ring event
-  // says so: it's the screen that started the timer (origin_client_id =
-  // this tab's id), it's logged in as one of target_user_ids (the owner, a
-  // kiosk login on a "kiosks" alarm), or broadcast_all ("everyone"). The
-  // tab that started a timer also rings on its own the instant its local
-  // countdown reaches zero (check()), so there's no wait for the server.
-  // Several alarms at once each get their own row and Stop button. Stop
-  // here stops it everywhere (screens, phones, speakers).
   window.__familyHubTimerAlarm = (function () {
     let modalEl = null;
     let audioCtx = null;
     let beepHandle = null;
-    const ringing = new Map(); // uid -> {title, body}
+    let activeUid = null;
+    // A timer's uid, once dismissed, stays dismissed - otherwise the very
+    // next poll's countdown tick (still <= 0 for a few more seconds until
+    // the backend's own sweep, up to TIMER_SWEEP_SECONDS later, actually
+    // removes it from family_hub/timers/list) would immediately re-open
+    // the modal a person just tapped Stop on. Unbounded but negligible: a
+    // few bytes per timer this ONE tab ever alarmed for in its lifetime.
     const dismissedUids = new Set();
-    let lastHass = null;
-    function myClientId() {
-      try {
-        let id = sessionStorage.getItem("family_hub_client_id");
-        if (!id) {
-          id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-          sessionStorage.setItem("family_hub_client_id", id);
-        }
-        return id;
-      } catch (e) {
-        return "";
-      }
-    }
     function ensureModal() {
       if (modalEl) return modalEl;
       modalEl = document.createElement("div");
@@ -201,57 +113,28 @@ if (!window.__familyHubTimerAlarm) {
         background: "rgba(20,16,8,0.78)",
       });
       modalEl.innerHTML =
-        '<div class="fh-timer-alarm-box" role="alertdialog" aria-live="assertive" style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:30px 26px;max-width:400px;width:88vw;max-height:86vh;overflow:auto;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
-        '<div style="font-size:48px;margin-bottom:6px;">&#9200;</div>' +
-        ('<div data-fh-t="text.time_s_up" class="fh-timer-alarm-head" style="font-size:14px;color:#96877a;margin-bottom:14px;font-weight:700;">' + __fhT("text.time_s_up", "Time's up!", null, "h") + '</div>') +
-        '<div class="fh-timer-alarm-list" style="display:flex;flex-direction:column;gap:12px;"></div>' +
-        ('<button data-fh-t="text.stop_all" type="button" class="fh-timer-alarm-stop-all" style="display:none;margin-top:16px;min-height:46px;width:100%;border:2px solid #8f5a00;border-radius:14px;background:transparent;color:#8f5a00;font-size:16px;font-weight:800;cursor:pointer;">' + __fhT("text.stop_all", "Stop all", null, "h") + '</button>') +
+        '<div style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:38px 30px;max-width:360px;width:88vw;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
+        '<div style="font-size:48px;margin-bottom:12px;">&#9200;</div>' +
+        '<div class="fh-timer-alarm-title" style="font-size:1.3em;font-weight:800;margin-bottom:6px;"></div>' +
+        '<div style="font-size:14px;color:#96877a;margin-bottom:24px;">Time\'s up!</div>' +
+        '<button type="button" class="fh-timer-alarm-stop" style="min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;">Stop</button>' +
         "</div>";
       document.body.appendChild(modalEl);
-      modalEl.addEventListener("click", (e) => {
-        const btn = e.target.closest && e.target.closest("button");
-        if (!btn) return;
-        if (btn.classList.contains("fh-timer-alarm-stop-all")) {
-          Array.from(ringing.keys()).forEach((uid) => stop(uid));
-        } else if (btn.dataset.uid) {
-          stop(btn.dataset.uid);
-        }
-      });
+      modalEl.querySelector(".fh-timer-alarm-stop").addEventListener("click", () => stop());
       return modalEl;
     }
-    function render() {
-      const el = ensureModal();
-      if (!ringing.size) {
-        el.style.display = "none";
-        return;
-      }
-      const list = el.querySelector(".fh-timer-alarm-list");
-      list.innerHTML = "";
-      ringing.forEach((info, uid) => {
-        const row = document.createElement("div");
-        const title = document.createElement("div");
-        title.className = "fh-timer-alarm-title";
-        title.style.cssText = "font-size:1.3em;font-weight:800;margin-bottom:4px;overflow-wrap:anywhere;";
-        title.textContent = info.title || __fhT("text.timer", "Timer");
-        row.appendChild(title);
-        if (info.body) {
-          const body = document.createElement("div");
-          body.style.cssText = "font-size:14px;color:#6b5f52;margin-bottom:10px;overflow-wrap:anywhere;";
-          body.textContent = info.body;
-          row.appendChild(body);
-        }
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "fh-timer-alarm-stop";
-        btn.dataset.uid = uid;
-        btn.textContent = __fhT("text.stop", "Stop");
-        btn.style.cssText = "min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;";
-        row.appendChild(btn);
-        list.appendChild(row);
-      });
-      el.querySelector(".fh-timer-alarm-stop-all").style.display = ringing.size > 1 ? "" : "none";
-      el.style.display = "flex";
-    }
+    // A plain oscillator beep via the Web Audio API - deliberately not a
+    // bundled sound file: no extra media asset for HACS/manual installs to
+    // ship or for a self-hosted install's network policy to worry about,
+    // and it sounds identical on every install.
+    //
+    // The original v1.119.0+ sound was one
+    // flat square-wave tone repeated once a second - metronomic, which is
+    // exactly what read as a countdown-bomb tick rather than an alarm. This
+    // plays a quick alternating two-pitch TRIPLET (a classic digital-alarm-
+    // clock trill) each cycle instead of a single tone, which is what
+    // actually reads as "alarm" to the ear - the alternating pitch is what
+    // a lone repeated tone can't give you, no matter how loud.
     function playBeep(atTime, freq) {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
@@ -265,7 +148,10 @@ if (!window.__familyHubTimerAlarm) {
       osc.start(atTime);
       osc.stop(atTime + 0.15);
     }
-    // A two-pitch alarm-clock trill via Web Audio (no sound file to ship).
+    // Scheduled via Web Audio's own clock (osc.start(atTime)) rather than
+    // three back-to-back setTimeout calls, so the triplet's timing stays
+    // tight even if the main JS thread is briefly busy - it's the crisp,
+    // even spacing that makes it read as a trill instead of a stutter.
     function beepOnce() {
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -273,11 +159,57 @@ if (!window.__familyHubTimerAlarm) {
         const now = audioCtx.currentTime;
         [[0, 1046], [0.15, 1318], [0.3, 1046]].forEach(([offset, freq]) => playBeep(now + offset, freq));
       } catch (e) {
-        // Autoplay blocked or no Web Audio - the modal is still the alarm.
+        // Autoplay blocked, or no Web Audio at all - the modal is still
+        // the primary alarm; sound is a bonus on top of it, not required.
       }
     }
-    // Ends whichever Family Hub screensaver is showing (they all close on
-    // pointerdown on their own overlay).
+    // which hass connection to tell "dismiss this everywhere"
+    // when Stop is tapped - set by whichever card most recently called
+    // ring()/check() with one, since this singleton is shared across every
+    // card on the dashboard and any of them may have `hass` by now. Best-
+    // effort only (see stop() below): a same-tab-only local alarm (the
+    // original v1.119.0+ behavior this singleton already had) never had a
+    // server-side record to begin with, so the dismiss call below simply
+    // no-ops for it (ws_dismiss_timer_alarm pops a uid that was never
+    // registered - see its own docstring for why that's silent, not an
+    // error).
+    let lastHass = null;
+    function stop() {
+      if (activeUid) dismissedUids.add(activeUid);
+      const uid = activeUid;
+      activeUid = null;
+      if (beepHandle) {
+        clearInterval(beepHandle);
+        beepHandle = null;
+      }
+      if (modalEl) modalEl.style.display = "none";
+      // household's explicit choice - "first tap wins, from
+      // anyone" - so tapping Stop here also clears the alarm everywhere
+      // else (other kiosks, other people's phones-that-are-dashboards)
+      // rather than just silencing this one tab. No permission gate, by
+      // design.
+      if (uid && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
+        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
+      }
+    }
+    // This modal already outranks the screensaver's own overlay (z-index
+    // 2147483647 vs 2147483000, set in ensureModal() above), so it was
+    // always painting on top of it - but a screensaver left running
+    // underneath still means its video/camera poll keeps going, so it
+    // needs to actually END, not just be covered up.
+    // There are THREE independent screensaver implementations in this
+    // project (the calendar card's own, the shared window.__familyHub
+    // ScreenSaver controller used by Chores/Rewards/My Chores/etc., and the
+    // standalone family-screensaver-card.js) and this singleton has no
+    // reference to whichever one might be running on this particular
+    // dashboard. Rather than importing all three, every one of them marks
+    // its overlay element with the same data-family-hub-screensaver
+    // attribute and already dismisses itself (hides, stops video/camera
+    // polling, navigates to its configured return dashboard) on its own
+    // overlay's "pointerdown" listener - so a synthetic pointerdown on
+    // whichever overlay is actually showing reuses each implementation's
+    // own real dismiss path for free, with zero coupling to which one it
+    // is.
     function wakeAnyScreenSaver() {
       try {
         const overlay = document.querySelector("[data-family-hub-screensaver]");
@@ -285,72 +217,75 @@ if (!window.__familyHubTimerAlarm) {
           overlay.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
         }
       } catch (e) {
-        // best-effort
+        // Best-effort - worst case the alarm modal still shows ON TOP of a
+        // running screensaver rather than ending it outright.
       }
     }
-    function start(uid, title, body, hass) {
+    function start(timer, hass) {
       if (hass) lastHass = hass;
-      if (!uid || dismissedUids.has(uid)) return;
-      const isNew = !ringing.has(uid);
-      ringing.set(uid, { title: title || (ringing.get(uid) || {}).title || "Timer", body: body || (ringing.get(uid) || {}).body || "" });
-      if (!isNew) return;
+      if (activeUid === timer.uid) return;
+      activeUid = timer.uid;
       wakeAnyScreenSaver();
-      render();
-      if (!beepHandle) {
-        beepOnce();
-        beepHandle = setInterval(beepOnce, 950);
-      }
-    }
-    function stop(uid) {
-      if (!uid) return;
-      dismissedUids.add(uid);
-      const had = ringing.delete(uid);
-      if (!ringing.size && beepHandle) {
-        clearInterval(beepHandle);
-        beepHandle = null;
-      }
-      render();
-      if (had && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
-        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
-      }
+      const el = ensureModal();
+      el.querySelector(".fh-timer-alarm-title").textContent = timer.title || "Timer";
+      el.style.display = "flex";
+      beepOnce();
+      if (beepHandle) clearInterval(beepHandle);
+      // Shorter gap than the old single-tone version (1200ms) since each
+      // cycle is now a ~450ms triplet, not a single ~340ms tone - this
+      // keeps the alarm feeling urgent/continuous rather than sparse.
+      beepHandle = setInterval(beepOnce, 950);
     }
     return {
-      // From a card's 1-second countdown tick: the tab that started a timer
-      // rings the moment it reaches zero (any timer it started, alarm-style
-      // or not, assigned or not).
+      // Call once a second from a card's own countdown ticker (the same
+      // tick that already repaints the visible "X:XX left" text), passing:
+      //   timers        - that card's own freshly-fetched timers list
+      //   clientId      - this tab's own id (see _familyHubClientId below)
+      //   remainingSecondsFn - a (timer) => seconds function, so this
+      //                   singleton reuses the CALLING card's own
+      //                   native-timer-aware math (_timerRemainingSeconds)
+      //                   instead of a second, potentially-drifting copy
+      //                   of it living here with no access to `hass`.
+      // Only a timer whose origin_client_id matches THIS tab's own id and
+      // whose alarm flag is on can ever trigger anything - a timer someone
+      // else started, or one this same tab started but didn't opt into
+      // alarms for, is silently ignored here exactly as before this
+      // feature existed.
       check(timers, clientId, remainingSecondsFn, hass) {
-        if (hass) lastHass = hass;
-        const me = clientId || myClientId();
-        if (!me) return;
-        (timers || []).forEach((t) => {
-          if (t && t.origin_client_id && t.origin_client_id === me && !dismissedUids.has(t.uid) && remainingSecondsFn(t) <= 0) {
-            start(t.uid, t.title || "Timer", "", hass);
-          }
-        });
+        if (!clientId) return;
+        const mine = (timers || []).find((t) => t.alarm && t.origin_client_id && t.origin_client_id === clientId);
+        if (!mine || dismissedUids.has(mine.uid)) return;
+        if (remainingSecondsFn(mine) <= 0) start(mine, hass);
       },
-      // The backend's ring event (and list_active_alarms on load).
+      // the WIDENED half - a household_timer_alarm_ring bus
+      // event (fired by chores_websocket_api.py's _dispatch_timer_alarm/
+      // _reannounce_active_alarms) that THIS login should also ring for,
+      // because it's either the timer's own owner, a login flagged as an
+      // always-on alarm kiosk, or the tier was "everyone." Unlike check()
+      // above (which only ever recognizes the ONE tab that started the
+      // timer, by origin_client_id), this recognizes a login/account -
+      // every open tab logged in as a matching user rings, on every
+      // dashboard, which is the whole point of the widened tiers. Re-fired
+      // on every re-announcement (see _reannounce_active_alarms), so
+      // calling this again for an already-ringing uid is a deliberate
+      // no-op (start() already short-circuits on activeUid === timer.uid).
       ringBroadcast(payload, hass, myUserId) {
         if (!payload || !payload.uid || dismissedUids.has(payload.uid)) return;
         const targets = payload.target_user_ids || [];
-        const fromHere = !!payload.origin_client_id && payload.origin_client_id === myClientId();
-        const shouldRing = !!payload.broadcast_all || fromHere || (myUserId && targets.includes(myUserId));
+        const shouldRing = !!payload.broadcast_all || (myUserId && targets.includes(myUserId));
         if (!shouldRing) return;
-        start(payload.uid, payload.timer_title || payload.title, payload.body, hass);
+        start({ uid: payload.uid, title: payload.title }, hass);
       },
-      // Someone stopped it somewhere else.
+      // The STOP half of the same broadcast pair - fired the instant
+      // ANY device dismisses (see ws_dismiss_timer_alarm's own "first tap
+      // wins" docstring), including a dismiss that originated from THIS
+      // singleton's own stop() above (that call's own dismiss already
+      // covers this tab; the event still arrives here a moment later and
+      // is a harmless no-op via stop()'s own activeUid !== uid guard, or
+      // via dismissedUids already containing it).
       stopFromServer(uid) {
-        if (!uid) return;
-        dismissedUids.add(uid);
-        if (ringing.delete(uid)) {
-          if (!ringing.size && beepHandle) {
-            clearInterval(beepHandle);
-            beepHandle = null;
-          }
-          render();
-        }
-      },
-      _ringing() {
-        return Array.from(ringing.keys());
+        if (uid) dismissedUids.add(uid);
+        if (activeUid === uid) stop();
       },
     };
   })();
@@ -492,44 +427,24 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     return (lang || "en").split("-")[0].toLowerCase();
   }
   _ensureTranslationsLoaded() {
-    __fhUseHass(this._hass);
     if (!this._hass || typeof this._hass.loadBackendTranslation !== "function") return;
     const lang = this._baseLanguage(this._hass.language);
-    if (this._i18nLoadedLang === lang) {
-      // v1.168.67 fix (GitHub issue #10 - "German localization on buttons
-      // only after click on settings"): Home Assistant hands cards the hass
-      // object that actually knows the newly loaded strings a moment AFTER
-      // loadBackendTranslation resolves, so the redraw in .then() below
-      // still ran with the old, English-only localize. Redraw once more
-      // whenever a new localize arrives for the already-loaded language.
-      if (this._hass.localize !== this._i18nLocalize) {
-        this._i18nLocalize = this._hass.localize;
-        this._onTranslationsReady();
-      }
-      return;
-    }
-    if (this._i18nLoading === lang) return;
+    if (this._i18nLoadedLang === lang || this._i18nLoading === lang) return;
     this._i18nLoading = lang;
     this._hass
       .loadBackendTranslation("fh_ui", "family_hub")
       .then(() => {
         this._i18nLoadedLang = lang;
         this._i18nLoading = null;
-        this._i18nLocalize = this._hass.localize;
-        this._onTranslationsReady();
+        this._applyTranslations();
+        this._render();
       })
       .catch((e) => {
         this._i18nLoading = null;
         console.warn("[family_hub] failed to load \"" + lang + "\" translations - staying on English fallback text", e);
       });
   }
-  // Redraws everything that shows translated text.
-  _onTranslationsReady() {
-    this._applyTranslations();
-    this._render();
-  }
   _applyTranslations() {
-    __fhSweep(this._root || this.shadowRoot);
     if (!this._root) return;
     this._root.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.dataset.i18n;
@@ -575,7 +490,7 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     try {
       const unsubRing = await this._hass.connection.subscribeEvents((event) => {
         if (window.__familyHubTimerAlarm) {
-          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, typeof this._myUserId === "function" ? this._myUserId() : myUserId);
+          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, myUserId);
         }
       }, "family_hub_timer_alarm_ring");
       const unsubStop = await this._hass.connection.subscribeEvents((event) => {
@@ -715,7 +630,7 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     };
   }
   _defaultSettings() {
-    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "slate" };
+    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "liquidglass" };
   }
   _getSettings() {
     return this._settingsCache || this._defaultSettings();
@@ -751,7 +666,7 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     });
     const cardOpacity = typeof g.cardOpacity === "number" ? g.cardOpacity : 100;
     const glassBlur = typeof g.glassBlur === "number" ? g.glassBlur : 0;
-    return { colors, cardOpacity, glassBlur, background: g.background || null };
+    return { colors, cardOpacity, glassBlur };
   }
   _resolveTheme(settings) {
     const local = settings.theme || this._defaultTheme();
@@ -794,17 +709,6 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     if (deviceOverride) return `device:${deviceOverride}`;
     return "household";
   }
-  _fhThemeBgVars(bg) {
-    const img = bg && typeof bg.image === "string" && bg.image ? bg.image : "";
-    if (!img) return { "--fc-bg-image": "none", "--fc-bg-overlay-image": "none", "--fc-bg-size": "cover", "--fc-bg-position": "center" };
-    const ov = this._hexToRgba(/^#[0-9a-fA-F]{6}$/.test(bg.overlayColor || "") ? bg.overlayColor : "#000000", Number(bg.overlayOpacity) || 0);
-    return {
-      "--fc-bg-image": `url("${img.replace(/"/g, '\\"')}")`,
-      "--fc-bg-overlay-image": `linear-gradient(${ov}, ${ov})`,
-      "--fc-bg-size": bg.size === "repeat" ? "auto" : bg.size || "cover",
-      "--fc-bg-position": bg.position || "center",
-    };
-  }
   _applyThemeVars() {
     const theme = this._resolveTheme(this._getSettings());
     // same "liquid glass" support family-week-calendar-card.js has
@@ -833,14 +737,6 @@ class FamilyHubActiveTimersCard extends HTMLElement {
       "--fc-surface2": this._hexToRgba(theme.colors.surface2, cardOpacity / 100),
       "--fc-glass-blur": `${glassBlur}px`,
     };
-        // v1.168.79 - the theme's own background image (the Liquid Glass
-    // aurora, or any image a theme sets in Theme Builder) now paints
-    // behind this card too, not just the calendar/Today cards - without
-    // it a glass theme's translucent surfaces only had a flat color to
-    // show through, so nothing looked like glass. Always set (to "none"
-    // when there's no image) so a cached earlier theme can't leave a
-    // stale image behind.
-    Object.assign(vars, this._fhThemeBgVars(theme.background));
     Object.keys(vars).forEach((name) => this.style.setProperty(name, vars[name]));
     if (window.__familyHubThemeCache) window.__familyHubThemeCache.set(this._familyHubThemeCacheKey(), vars);
   }
@@ -1328,14 +1224,9 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     // AUDIENCE), now offered here too. Resets to "self" (the pre-existing
     // behavior) every time the modal opens, same as _draftMinutes above.
     this._draftAlarmAudience = "self";
-    this._draftSpeakers = [];
     const presetBtns = TIMER_PRESETS.map(
       (m) => `<button type="button" class="preset-btn" data-minutes="${m}">${this._formatTimerLength(m)}</button>`
     ).join("");
-    const speakerChips = ((this._getSettings() || {}).alarmDevices || [])
-      .filter((d) => d && d.entity_id)
-      .map((d) => `<button type="button" class="q-speaker-btn" data-id="${this._esc(d.entity_id)}">${d.domain === "assist_satellite" ? "&#127908;" : "&#128266;"} ${this._esc(d.name || d.entity_id)}</button>`)
-      .join("");
     const userOptions = (this._users || [])
       .map((u) => `<option value="${this._esc(u.id)}">${this._esc(u.name)}</option>`)
       .join("");
@@ -1348,7 +1239,7 @@ class FamilyHubActiveTimersCard extends HTMLElement {
           <input type="number" class="q-seconds" min="0" max="59" placeholder="sec">
         </div>
       </label>
-      <label><span>${this._t("active_timers.whats_it_for_label", "What's it for? (optional)")}</span><input data-fh-placeholder="text.oven_sam_s_turn_laundry" type="text" class="q-label" maxlength="60" placeholder="${__fhT("text.oven_sam_s_turn_laundry", "Oven, Sam's turn, laundry...", null, "h")}"></label>
+      <label><span>${this._t("active_timers.whats_it_for_label", "What's it for? (optional)")}</span><input type="text" class="q-label" maxlength="60" placeholder="Oven, Sam's turn, laundry..."></label>
       <label><span>${this._t("active_timers.assign_to_label", "Assign to (optional)")}</span><select class="q-user"><option value="">${this._t("active_timers.nobody_option", "Nobody - just a house timer")}</option>${userOptions}</select></label>
       <label><span>${this._t("active_timers.who_hears_label", "Who hears this alarm")}</span>
         <div class="q-audience-row">
@@ -1356,9 +1247,7 @@ class FamilyHubActiveTimersCard extends HTMLElement {
           <button type="button" class="q-audience-btn" data-value="kiosks">${this._t("active_timers.audience_kiosks", "Them + kiosks")}</button>
           <button type="button" class="q-audience-btn" data-value="everyone">${this._t("active_timers.audience_everyone", "Everyone")}</button>
         </div>
-        <div class="q-hint">${this._t("active_timers.audience_hint", "Just them: their own screens, phones and speakers - or, for a house timer, this screen and the house speakers. It keeps ringing until someone taps Stop.")}</div>
       </label>
-      ${speakerChips ? `<label><span>${this._t("active_timers.speakers_label", "Ring on these speakers (optional)")}</span><div class="q-speaker-row">${speakerChips}</div><div class="q-hint">${this._t("active_timers.speakers_hint", "Leave empty to use each speaker's own \"Rings for\" setting.")}</div></label>` : ""}
       <div class="modal-actions">
         <button type="button" class="cancel-btn">${this._t("common.cancel", "Cancel")}</button>
         <button type="button" class="save-btn" disabled>${this._t("active_timers.start_btn", "Start")}</button>
@@ -1394,12 +1283,6 @@ class FamilyHubActiveTimersCard extends HTMLElement {
         box.querySelectorAll(".q-audience-btn").forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         this._draftAlarmAudience = btn.dataset.value;
-      });
-    });
-    box.querySelectorAll(".q-speaker-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        btn.classList.toggle("active");
-        this._draftSpeakers = Array.from(box.querySelectorAll(".q-speaker-btn.active")).map((b) => b.dataset.id);
       });
     });
     box.querySelector(".cancel-btn").addEventListener("click", () => overlay.classList.remove("open"));
@@ -1446,8 +1329,6 @@ class FamilyHubActiveTimersCard extends HTMLElement {
         // "who hears this alarm" - see the button row's own
         // comment above.
         alarm_audience: this._draftAlarmAudience || "self",
-        alarm_device_ids: this._draftSpeakers || [],
-        source: "timers",
       });
     } catch (e) {
       errEl.textContent = (e && e.message) || this._t("active_timers.couldnt_start_timer", "Couldn't start that timer.");
@@ -1455,141 +1336,6 @@ class FamilyHubActiveTimersCard extends HTMLElement {
     }
     overlay.classList.remove("open");
     await this._fetchTimers();
-  }
-
-  // v1.168.74: the timer log - every timer, who set it and from where, how
-  // it ended, where it rang and who stopped it (family_hub/timers/history).
-  async _openTimerLog() {
-    const overlay = this._root.querySelector(".timer-log-modal");
-    const box = overlay.querySelector(".log-box");
-    const t = (k, f, v) => this._esc(this._t(k, f, v));
-    box.innerHTML = `<h3>${t("active_timers.log_heading", "Timer log")}</h3><div class="log-list">${t("active_timers.log_loading", "Loading…")}</div><div class="modal-actions"><button type="button" class="cancel-btn log-close">${t("common.close", "Close")}</button></div>`;
-    box.querySelector(".log-close").addEventListener("click", () => overlay.classList.remove("open"));
-    overlay.classList.add("open");
-    let entries = [];
-    try {
-      const res = await this._hass.connection.sendMessagePromise({ type: "family_hub/timers/history", limit: 100 });
-      entries = (res && res.entries) || [];
-    } catch (e) {
-      box.querySelector(".log-list").textContent = this._t("active_timers.log_error", "Couldn't load the timer log.");
-      return;
-    }
-    const list = box.querySelector(".log-list");
-    if (!entries.length) {
-      list.innerHTML = `<div class="log-empty">${t("active_timers.log_empty", "No timers yet.")}</div>`;
-      return;
-    }
-    list.innerHTML = entries.map((e) => this._timerLogEntryHtml(e)).join("");
-    list.querySelectorAll(".log-stop-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        btn.disabled = true;
-        try {
-          await this._hass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid: btn.dataset.uid });
-        } catch (err) {
-          // ignore
-        }
-        this._openTimerLog();
-      });
-    });
-  }
-  _timerLogWhen(iso) {
-    if (!iso) return "";
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return "";
-    const lang = (this._hass && ((this._hass.locale && this._hass.locale.language) || this._hass.language)) || undefined;
-    const tf = this._hass && this._hass.locale && this._hass.locale.time_format;
-    const opts = { hour: "numeric", minute: "2-digit" };
-    if (tf === "24") opts.hour12 = false;
-    if (tf === "12") opts.hour12 = true;
-    let time;
-    try {
-      time = d.toLocaleTimeString(lang, opts);
-    } catch (e) {
-      time = d.toLocaleTimeString();
-    }
-    const today = new Date();
-    if (d.toDateString() === today.toDateString()) return time;
-    let day;
-    try {
-      day = d.toLocaleDateString(lang, { weekday: "short", month: "short", day: "numeric" });
-    } catch (e) {
-      day = d.toDateString();
-    }
-    return `${day} ${time}`;
-  }
-  _timerLogEntryHtml(e) {
-    const t = (k, f, v) => this._esc(this._t(k, f, v));
-    const kinds = { chore: t("active_timers.log_kind_chore", "Chore"), reward: t("active_timers.log_kind_reward", "Reward"), standalone: t("active_timers.log_kind_timer", "Timer") };
-    const sources = {
-      chores: t("active_timers.log_src_chores", "the Chores card"),
-      rewards: t("active_timers.log_src_rewards", "the Rewards card"),
-      timers: t("active_timers.log_src_timers", "Active Timers"),
-      automation: t("active_timers.log_src_automation", "an automation"),
-    };
-    const outcomeLabel = e.ringing
-      ? t("active_timers.log_ringing", "Ringing")
-      : { running: t("active_timers.log_running", "Running"), finished: t("active_timers.log_finished", "Finished"), cancelled: t("active_timers.log_cancelled", "Cancelled") }[e.outcome] ||
-        t("active_timers.log_unknown", "Ended");
-    const lines = [];
-    const who = e.user_name || t("active_timers.log_house", "House timer");
-    const setBy = e.started_by_name
-      ? t("active_timers.log_set_by", "Set by %name%", { name: e.started_by_name })
-      : t("active_timers.log_set_by_unknown", "Set by an automation");
-    const from = sources[e.source] && !(e.source === "automation" && !e.started_by_name) ? t("active_timers.log_from", "from %where%", { where: this._t(`active_timers.log_src_${e.source}`, { chores: "the Chores card", rewards: "the Rewards card", timers: "Active Timers", automation: "an automation" }[e.source]) }) : "";
-    lines.push(`${this._esc(who)} · ${setBy}${from ? " " + from : ""} · ${this._esc(this._formatTimerLength(e.duration_minutes))}`);
-    const when = [t("active_timers.log_started", "Started %time%", { time: this._timerLogWhen(e.started_at) })];
-    if (e.ended_at) when.push(t("active_timers.log_ended", "ended %time%", { time: this._timerLogWhen(e.ended_at) }));
-    else if (e.outcome === "running" && e.ends_at) when.push(t("active_timers.log_ends", "ends %time%", { time: this._timerLogWhen(e.ends_at) }));
-    lines.push(when.join(" · "));
-    const results = {
-      completed: t("active_timers.log_result_completed", "Chore completed - stars paid"),
-      sent_for_approval: t("active_timers.log_result_approval", "Chore sent for approval"),
-      chore_deleted: t("active_timers.log_result_deleted", "Chore was deleted - no alarm"),
-      chore_already_done: t("active_timers.log_result_done", "Chore was already done - no alarm"),
-    };
-    if (e.result && results[e.result]) lines.push(results[e.result]);
-    if (e.outcome === "cancelled") {
-      const reasons = {
-        home_assistant: t("active_timers.log_cancel_ha", "Stopped from Home Assistant"),
-        chore_changed: t("active_timers.log_cancel_chore", "Its chore was finished, changed or deleted"),
-        automation: t("active_timers.log_cancel_automation", "Cancelled by an automation"),
-      };
-      lines.push(
-        reasons[e.cancel_reason] && !e.cancelled_by_name
-          ? reasons[e.cancel_reason]
-          : t("active_timers.log_cancelled_by", "Cancelled by %name%", { name: e.cancelled_by_name || this._t("active_timers.log_someone", "someone") })
-      );
-    }
-    const a = e.alarm || {};
-    if (a.rang_at) {
-      const prettyPhone = (p) => String(p || "").replace(/^notify\./, "").replace(/^mobile_app_/, "").replace(/_/g, " ");
-      const places = []
-        .concat(a.screens || [])
-        .concat((a.speakers || []).map((x) => x))
-        .concat((a.phones || []).map(prettyPhone));
-      lines.push(t("active_timers.log_rang_on", "Rang on: %places%", { places: places.length ? places.join(", ") : this._t("active_timers.log_nowhere", "nowhere set up") }));
-      if (a.stopped_at) {
-        const via = {
-          screen: this._t("active_timers.log_via_screen", "a screen"),
-          phone: this._t("active_timers.log_via_phone", "a phone"),
-          automation: this._t("active_timers.log_via_automation", "an automation"),
-        }[a.stopped_via];
-        lines.push(
-          a.stopped_via === "auto"
-            ? t("active_timers.log_auto_stopped", "Nobody stopped it - it went quiet by itself after 30 minutes")
-            : t("active_timers.log_stopped", "Stopped by %name% from %via% at %time%", {
-                name: a.stopped_by_name || this._t("active_timers.log_someone", "someone"),
-                via: via || this._t("active_timers.log_via_screen", "a screen"),
-                time: this._timerLogWhen(a.stopped_at),
-              })
-        );
-      }
-    }
-    return `<div class="log-entry log-${this._esc(e.ringing ? "ringing" : e.outcome || "unknown")}">
-      <div class="log-top"><span class="log-kind">${kinds[e.kind] || kinds.standalone}</span><span class="log-title">${this._esc(e.title || kinds[e.kind] || "Timer")}</span><span class="log-outcome">${outcomeLabel}</span></div>
-      ${lines.map((l) => `<div class="log-line">${l}</div>`).join("")}
-      ${e.ringing ? `<button type="button" class="log-stop-btn" data-uid="${this._esc(e.uid)}">${t("active_timers.log_stop", "Stop alarm")}</button>` : ""}
-    </div>`;
   }
 
   _build() {
@@ -1607,17 +1353,14 @@ class FamilyHubActiveTimersCard extends HTMLElement {
         <div class="header">
           <div class="title"></div>
           <span class="timer-count"></span>
-          <button class="timer-log-btn" title="Timer log" data-i18n-title="active_timers.log_title">&#128338; <span data-i18n="active_timers.log_btn">Log</span></button>
           <button class="add-timer-btn">&#65291; <span data-i18n="active_timers.start_timer_btn">Start Timer</span></button>
         </div>
         <div class="timers-board"></div>
       </ha-card>
       <div class="modal-overlay quick-timer-modal"><div class="modal-box"></div></div>
-      <div class="modal-overlay timer-log-modal"><div class="modal-box log-box"></div></div>
     `;
     this._root = root;
     root.querySelector(".add-timer-btn").addEventListener("click", () => this._openQuickTimerModal());
-    root.querySelector(".timer-log-btn").addEventListener("click", () => this._openTimerLog());
     root.querySelectorAll(".modal-overlay").forEach((overlay) => {
       overlay.addEventListener("click", (e) => {
         if (e.target === overlay) overlay.classList.remove("open");
@@ -1635,7 +1378,7 @@ class FamilyHubActiveTimersCard extends HTMLElement {
         --fc-bg: #fbf7e5; --fc-card: #f5f3f0; --fc-border: #e6ddc4; --fc-text: #423d34; --fc-text-secondary: #96877a;
         --fc-accent: #8f5a00; --fc-accent-text: #fff8ea; --fc-accent2: #305545; --fc-accent3: #b5583c;
         --fc-surface-alt: #efe6cf; --fc-surface2: #f2eede; }
-      ha-card { background: var(--fc-bg); background-image: var(--fc-bg-overlay-image, none), var(--fc-bg-image, none); background-size: cover, var(--fc-bg-size, cover); background-position: center, var(--fc-bg-position, center); color: var(--fc-text); padding: 14px; height: 100%; box-sizing: border-box; overflow-y: auto; }
+      ha-card { background: var(--fc-bg); color: var(--fc-text); padding: 14px; height: 100%; box-sizing: border-box; overflow-y: auto; }
       .header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
       .title { font-size: 18px; font-weight: 800; flex: 1 1 auto; min-width: 0; }
       .timer-count { flex: 0 0 auto; background: var(--fc-surface-alt); color: var(--fc-accent2); border-radius: 8px; padding: 1px 8px; font-size: 12px; font-weight: 800; }
@@ -1691,26 +1434,6 @@ class FamilyHubActiveTimersCard extends HTMLElement {
       .q-audience-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
       .q-audience-btn { flex: 1 1 0; min-width: 88px; min-height: 40px; border: 2px solid var(--fc-border); border-radius: 10px; padding: 8px 6px; font-size: 12.5px; font-weight: 800; background: var(--fc-surface2); color: var(--fc-text); cursor: pointer; }
       .q-audience-btn.active { background: var(--fc-accent); color: var(--fc-accent-text); border-color: var(--fc-accent); }
-      .q-hint { font-size: 11.5px; color: var(--fc-text-secondary); margin-top: 4px; font-weight: 400; line-height: 1.35; }
-      .q-speaker-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
-      .q-speaker-btn { border: 2px solid var(--fc-border); border-radius: 10px; padding: 6px 10px; font-size: 12.5px; font-weight: 800; background: var(--fc-surface2); color: var(--fc-text); cursor: pointer; }
-      .q-speaker-btn.active { background: var(--fc-accent); color: var(--fc-accent-text); border-color: var(--fc-accent); }
-      .timer-log-btn { flex: 0 0 auto; border: none; border-radius: 12px; padding: 10px 12px; font-size: 14px; font-weight: 700; cursor: pointer; background: var(--fc-surface-alt); color: var(--fc-text); }
-      .log-box { max-width: 560px; }
-      .log-list { display: flex; flex-direction: column; gap: 8px; max-height: 64vh; overflow-y: auto; }
-      .log-entry { border-radius: 12px; padding: 10px 12px; background: var(--fc-card); border-left: 4px solid var(--fc-border); }
-      .log-entry.log-finished { border-left-color: var(--fc-accent2); }
-      .log-entry.log-cancelled { border-left-color: var(--fc-text-secondary); }
-      .log-entry.log-running { border-left-color: var(--fc-accent); }
-      .log-entry.log-ringing { border-left-color: var(--fc-accent3); }
-      .log-top { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
-      .log-kind { font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; color: var(--fc-text-secondary); }
-      .log-title { font-weight: 800; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-      .log-outcome { font-size: 12px; font-weight: 800; color: var(--fc-text-secondary); }
-      .log-ringing .log-outcome { color: var(--fc-accent3); }
-      .log-line { font-size: 12.5px; color: var(--fc-text-secondary); line-height: 1.4; overflow-wrap: anywhere; }
-      .log-empty { color: var(--fc-text-secondary); font-style: italic; }
-      .log-stop-btn { margin-top: 6px; border: none; border-radius: 10px; padding: 6px 14px; font-weight: 800; background: var(--fc-accent3); color: #fff; cursor: pointer; }
       .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
       .modal-actions button { border: none; border-radius: 10px; padding: 8px 16px; font-weight: 700; cursor: pointer; }
       .save-btn { background: var(--fc-accent); color: var(--fc-accent-text); }

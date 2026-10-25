@@ -3637,7 +3637,7 @@ def _coerce_calendar_datetime(value: str, *, is_date_only: bool):
     if is_date_only:
         return date.fromisoformat(value)
     parsed = datetime.fromisoformat(value.replace(" ", "T", 1))
-    # v1.168.84: give a timed event Home Assistant's own time zone, the
+    # v1.168.85: give a timed event Home Assistant's own time zone, the
     # same as HA's own calendar service and frontend do. Local Calendar
     # stored a naive time as a "floating" event, and a repeating floating
     # event with an end date (UNTIL, which the card sends in UTC as the
@@ -3789,7 +3789,7 @@ async def _ws_get_calendar_delete_support(
             "create_supported": create_supported,
             "platform": platform,
             "integration_name": integration_name,
-            # v1.168.84: while Home Assistant is still starting (or the
+            # v1.168.85: while Home Assistant is still starting (or the
             # calendar's integration is reloading) the entity has no state
             # yet, so supported_features reads as 0 and everything above
             # comes out False. Flag it so the card treats the answer as
