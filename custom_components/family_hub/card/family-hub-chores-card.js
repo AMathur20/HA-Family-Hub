@@ -1,3 +1,71 @@
+// ---- Family Hub shared translation helper (v1.168.76) -------------------
+// __fhT(key, english, vars, mode) looks a string up in Home Assistant's
+// loaded "fh_ui" translations (translations/<language>.json → fh_ui.text.*)
+// and falls back to the English text written right here in the source.
+// vars fill %0%, %1%, ... placeholders. mode "h" escapes the translated
+// text (not the vars, which callers already prepared) for use inside HTML
+// markup or an attribute value. Identical copy in every Family Hub card and
+// in the Theme Builder panel - whichever loads first sets it up.
+// __fhSweep(root) re-translates markup that was drawn before the language
+// file finished loading (elements tagged data-fh-t / data-fh-title /
+// data-fh-placeholder / data-fh-aria / data-fh-alt), but only while they
+// still show the English original, so text a card later replaced with
+// something else is never overwritten.
+var __fhI18n = (window.__familyHubI18n = window.__familyHubI18n || { hass: null, fb: {}, loading: null, loaded: null });
+var __fhEsc = function (s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+};
+var __fhT = function (key, fb, vars, mode) {
+  var g = window.__familyHubI18n || __fhI18n;
+  if (g.fb[key] === undefined) g.fb[key] = fb;
+  var str = "";
+  try {
+    if (g.hass && typeof g.hass.localize === "function") str = g.hass.localize("component.family_hub.fh_ui." + key) || "";
+  } catch (e) {
+    str = "";
+  }
+  if (!str) str = fb;
+  if (mode === "h") str = __fhEsc(str);
+  if (vars) {
+    Object.keys(vars).forEach(function (k) {
+      var v = vars[k];
+      str = str.split("%" + k + "%").join(v === null || v === undefined ? "" : String(v));
+    });
+  }
+  return str;
+};
+var __fhUseHass = function (hass) {
+  if (hass && typeof hass.localize === "function") (window.__familyHubI18n || __fhI18n).hass = hass;
+};
+var __fhSweep = function (root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  var g = window.__familyHubI18n || __fhI18n;
+  root.querySelectorAll("[data-fh-t]").forEach(function (el) {
+    var key = el.getAttribute("data-fh-t");
+    var fb = g.fb[key];
+    if (fb === undefined) return;
+    var cur = (el.textContent || "").trim();
+    if (cur !== fb && cur !== el.__fhShown) return;
+    var next = __fhT(key, fb);
+    if (cur !== next) el.textContent = next;
+    el.__fhShown = next;
+  });
+  [["data-fh-title", "title"], ["data-fh-placeholder", "placeholder"], ["data-fh-aria", "aria-label"], ["data-fh-alt", "alt"]].forEach(function (pair) {
+    root.querySelectorAll("[" + pair[0] + "]").forEach(function (el) {
+      var key = el.getAttribute(pair[0]);
+      var fb = g.fb[key];
+      if (fb === undefined) return;
+      var cur = el.getAttribute(pair[1]);
+      var shownKey = "__fhShown_" + pair[1];
+      if (cur !== fb && cur !== el[shownKey]) return;
+      var next = __fhT(key, fb);
+      if (cur !== next) el.setAttribute(pair[1], next);
+      el[shownKey] = next;
+    });
+  });
+};
+// -------------------------------------------------------------------------
+
 (function () {
   if (window.__familyCalendarFontLoaded) return;
   window.__familyCalendarFontLoaded = true;
@@ -516,6 +584,8 @@ const ASSIGNMENT_MODES = [
   { value: "chore_bin", label: "Chore Bin (anyone can claim)", title: "Sits unassigned until someone taps Claim" },
 ];
 const CHORE_BIN_SENTINEL = "chore_bin";
+// v1.168.65: the Waiting to Recur pill's id (matches its column's data-col-id).
+const WAITING_TO_RECUR_PILL_ID = "waiting_to_recur";
 // "remind me N minutes before this is due" - the exact same lead-
 // time values the calendar card offers for its own event reminders (see
 // that file's own minutesOptions in _renderEventInfoRemindSection), kept
@@ -928,18 +998,38 @@ if (!window.__familyHubKioskSession) {
 // shadow root, so it keeps working even if whichever card first noticed
 // the alarm gets scrolled off-screen or unmounted afterward.
 if (!window.__familyHubTimerAlarm) {
+  // v1.168.74 (timer + alarm overhaul): the on-screen half of a Family Hub
+  // timer alarm - a full-screen "time's up" with a looping alarm sound that
+  // keeps going until someone taps Stop, shared by every Family Hub card on
+  // the page (one modal, one sound, appended to document.body).
+  //
+  // A screen rings when the backend's family_hub_timer_alarm_ring event
+  // says so: it's the screen that started the timer (origin_client_id =
+  // this tab's id), it's logged in as one of target_user_ids (the owner, a
+  // kiosk login on a "kiosks" alarm), or broadcast_all ("everyone"). The
+  // tab that started a timer also rings on its own the instant its local
+  // countdown reaches zero (check()), so there's no wait for the server.
+  // Several alarms at once each get their own row and Stop button. Stop
+  // here stops it everywhere (screens, phones, speakers).
   window.__familyHubTimerAlarm = (function () {
     let modalEl = null;
     let audioCtx = null;
     let beepHandle = null;
-    let activeUid = null;
-    // A timer's uid, once dismissed, stays dismissed - otherwise the very
-    // next poll's countdown tick (still <= 0 for a few more seconds until
-    // the backend's own sweep, up to TIMER_SWEEP_SECONDS later, actually
-    // removes it from family_hub/timers/list) would immediately re-open
-    // the modal a person just tapped Stop on. Unbounded but negligible: a
-    // few bytes per timer this ONE tab ever alarmed for in its lifetime.
+    const ringing = new Map(); // uid -> {title, body}
     const dismissedUids = new Set();
+    let lastHass = null;
+    function myClientId() {
+      try {
+        let id = sessionStorage.getItem("family_hub_client_id");
+        if (!id) {
+          id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          sessionStorage.setItem("family_hub_client_id", id);
+        }
+        return id;
+      } catch (e) {
+        return "";
+      }
+    }
     function ensureModal() {
       if (modalEl) return modalEl;
       modalEl = document.createElement("div");
@@ -950,28 +1040,57 @@ if (!window.__familyHubTimerAlarm) {
         background: "rgba(20,16,8,0.78)",
       });
       modalEl.innerHTML =
-        '<div style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:38px 30px;max-width:360px;width:88vw;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
-        '<div style="font-size:48px;margin-bottom:12px;">&#9200;</div>' +
-        '<div class="fh-timer-alarm-title" style="font-size:1.3em;font-weight:800;margin-bottom:6px;"></div>' +
-        '<div style="font-size:14px;color:#96877a;margin-bottom:24px;">Time\'s up!</div>' +
-        '<button type="button" class="fh-timer-alarm-stop" style="min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;">Stop</button>' +
+        '<div class="fh-timer-alarm-box" role="alertdialog" aria-live="assertive" style="background:#fff8ea;color:#3a352c;border-radius:22px;padding:30px 26px;max-width:400px;width:88vw;max-height:86vh;overflow:auto;text-align:center;box-shadow:0 14px 46px rgba(0,0,0,0.45);font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;">' +
+        '<div style="font-size:48px;margin-bottom:6px;">&#9200;</div>' +
+        ('<div data-fh-t="text.time_s_up" class="fh-timer-alarm-head" style="font-size:14px;color:#96877a;margin-bottom:14px;font-weight:700;">' + __fhT("text.time_s_up", "Time's up!", null, "h") + '</div>') +
+        '<div class="fh-timer-alarm-list" style="display:flex;flex-direction:column;gap:12px;"></div>' +
+        ('<button data-fh-t="text.stop_all" type="button" class="fh-timer-alarm-stop-all" style="display:none;margin-top:16px;min-height:46px;width:100%;border:2px solid #8f5a00;border-radius:14px;background:transparent;color:#8f5a00;font-size:16px;font-weight:800;cursor:pointer;">' + __fhT("text.stop_all", "Stop all", null, "h") + '</button>') +
         "</div>";
       document.body.appendChild(modalEl);
-      modalEl.querySelector(".fh-timer-alarm-stop").addEventListener("click", () => stop());
+      modalEl.addEventListener("click", (e) => {
+        const btn = e.target.closest && e.target.closest("button");
+        if (!btn) return;
+        if (btn.classList.contains("fh-timer-alarm-stop-all")) {
+          Array.from(ringing.keys()).forEach((uid) => stop(uid));
+        } else if (btn.dataset.uid) {
+          stop(btn.dataset.uid);
+        }
+      });
       return modalEl;
     }
-    // A plain oscillator beep via the Web Audio API - deliberately not a
-    // bundled sound file: no extra media asset for HACS/manual installs to
-    // ship or for a self-hosted install's network policy to worry about,
-    // and it sounds identical on every install.
-    //
-    // The original v1.119.0+ sound was one
-    // flat square-wave tone repeated once a second - metronomic, which is
-    // exactly what read as a countdown-bomb tick rather than an alarm. This
-    // plays a quick alternating two-pitch TRIPLET (a classic digital-alarm-
-    // clock trill) each cycle instead of a single tone, which is what
-    // actually reads as "alarm" to the ear - the alternating pitch is what
-    // a lone repeated tone can't give you, no matter how loud.
+    function render() {
+      const el = ensureModal();
+      if (!ringing.size) {
+        el.style.display = "none";
+        return;
+      }
+      const list = el.querySelector(".fh-timer-alarm-list");
+      list.innerHTML = "";
+      ringing.forEach((info, uid) => {
+        const row = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "fh-timer-alarm-title";
+        title.style.cssText = "font-size:1.3em;font-weight:800;margin-bottom:4px;overflow-wrap:anywhere;";
+        title.textContent = info.title || __fhT("text.timer", "Timer");
+        row.appendChild(title);
+        if (info.body) {
+          const body = document.createElement("div");
+          body.style.cssText = "font-size:14px;color:#6b5f52;margin-bottom:10px;overflow-wrap:anywhere;";
+          body.textContent = info.body;
+          row.appendChild(body);
+        }
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "fh-timer-alarm-stop";
+        btn.dataset.uid = uid;
+        btn.textContent = __fhT("text.stop", "Stop");
+        btn.style.cssText = "min-height:54px;width:100%;border:none;border-radius:14px;background:#8f5a00;color:#fff8ea;font-size:19px;font-weight:800;cursor:pointer;";
+        row.appendChild(btn);
+        list.appendChild(row);
+      });
+      el.querySelector(".fh-timer-alarm-stop-all").style.display = ringing.size > 1 ? "" : "none";
+      el.style.display = "flex";
+    }
     function playBeep(atTime, freq) {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
@@ -985,10 +1104,7 @@ if (!window.__familyHubTimerAlarm) {
       osc.start(atTime);
       osc.stop(atTime + 0.15);
     }
-    // Scheduled via Web Audio's own clock (osc.start(atTime)) rather than
-    // three back-to-back setTimeout calls, so the triplet's timing stays
-    // tight even if the main JS thread is briefly busy - it's the crisp,
-    // even spacing that makes it read as a trill instead of a stutter.
+    // A two-pitch alarm-clock trill via Web Audio (no sound file to ship).
     function beepOnce() {
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -996,57 +1112,11 @@ if (!window.__familyHubTimerAlarm) {
         const now = audioCtx.currentTime;
         [[0, 1046], [0.15, 1318], [0.3, 1046]].forEach(([offset, freq]) => playBeep(now + offset, freq));
       } catch (e) {
-        // Autoplay blocked, or no Web Audio at all - the modal is still
-        // the primary alarm; sound is a bonus on top of it, not required.
+        // Autoplay blocked or no Web Audio - the modal is still the alarm.
       }
     }
-    // which hass connection to tell "dismiss this everywhere"
-    // when Stop is tapped - set by whichever card most recently called
-    // ring()/check() with one, since this singleton is shared across every
-    // card on the dashboard and any of them may have `hass` by now. Best-
-    // effort only (see stop() below): a same-tab-only local alarm (the
-    // original v1.119.0+ behavior this singleton already had) never had a
-    // server-side record to begin with, so the dismiss call below simply
-    // no-ops for it (ws_dismiss_timer_alarm pops a uid that was never
-    // registered - see its own docstring for why that's silent, not an
-    // error).
-    let lastHass = null;
-    function stop() {
-      if (activeUid) dismissedUids.add(activeUid);
-      const uid = activeUid;
-      activeUid = null;
-      if (beepHandle) {
-        clearInterval(beepHandle);
-        beepHandle = null;
-      }
-      if (modalEl) modalEl.style.display = "none";
-      // household's explicit choice - "first tap wins, from
-      // anyone" - so tapping Stop here also clears the alarm everywhere
-      // else (other kiosks, other people's phones-that-are-dashboards)
-      // rather than just silencing this one tab. No permission gate, by
-      // design.
-      if (uid && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
-        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
-      }
-    }
-    // This modal already outranks the screensaver's own overlay (z-index
-    // 2147483647 vs 2147483000, set in ensureModal() above), so it was
-    // always painting on top of it - but a screensaver left running
-    // underneath still means its video/camera poll keeps going, so it
-    // needs to actually END, not just be covered up.
-    // There are THREE independent screensaver implementations in this
-    // project (the calendar card's own, the shared window.__familyHub
-    // ScreenSaver controller used by Chores/Rewards/My Chores/etc., and the
-    // standalone family-screensaver-card.js) and this singleton has no
-    // reference to whichever one might be running on this particular
-    // dashboard. Rather than importing all three, every one of them marks
-    // its overlay element with the same data-family-hub-screensaver
-    // attribute and already dismisses itself (hides, stops video/camera
-    // polling, navigates to its configured return dashboard) on its own
-    // overlay's "pointerdown" listener - so a synthetic pointerdown on
-    // whichever overlay is actually showing reuses each implementation's
-    // own real dismiss path for free, with zero coupling to which one it
-    // is.
+    // Ends whichever Family Hub screensaver is showing (they all close on
+    // pointerdown on their own overlay).
     function wakeAnyScreenSaver() {
       try {
         const overlay = document.querySelector("[data-family-hub-screensaver]");
@@ -1054,75 +1124,72 @@ if (!window.__familyHubTimerAlarm) {
           overlay.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
         }
       } catch (e) {
-        // Best-effort - worst case the alarm modal still shows ON TOP of a
-        // running screensaver rather than ending it outright.
+        // best-effort
       }
     }
-    function start(timer, hass) {
+    function start(uid, title, body, hass) {
       if (hass) lastHass = hass;
-      if (activeUid === timer.uid) return;
-      activeUid = timer.uid;
+      if (!uid || dismissedUids.has(uid)) return;
+      const isNew = !ringing.has(uid);
+      ringing.set(uid, { title: title || (ringing.get(uid) || {}).title || "Timer", body: body || (ringing.get(uid) || {}).body || "" });
+      if (!isNew) return;
       wakeAnyScreenSaver();
-      const el = ensureModal();
-      el.querySelector(".fh-timer-alarm-title").textContent = timer.title || "Timer";
-      el.style.display = "flex";
-      beepOnce();
-      if (beepHandle) clearInterval(beepHandle);
-      // Shorter gap than the old single-tone version (1200ms) since each
-      // cycle is now a ~450ms triplet, not a single ~340ms tone - this
-      // keeps the alarm feeling urgent/continuous rather than sparse.
-      beepHandle = setInterval(beepOnce, 950);
+      render();
+      if (!beepHandle) {
+        beepOnce();
+        beepHandle = setInterval(beepOnce, 950);
+      }
+    }
+    function stop(uid) {
+      if (!uid) return;
+      dismissedUids.add(uid);
+      const had = ringing.delete(uid);
+      if (!ringing.size && beepHandle) {
+        clearInterval(beepHandle);
+        beepHandle = null;
+      }
+      render();
+      if (had && lastHass && lastHass.connection && lastHass.connection.sendMessagePromise) {
+        lastHass.connection.sendMessagePromise({ type: "family_hub/timers/dismiss_alarm", uid }).catch(() => {});
+      }
     }
     return {
-      // Call once a second from a card's own countdown ticker (the same
-      // tick that already repaints the visible "X:XX left" text), passing:
-      //   timers        - that card's own freshly-fetched timers list
-      //   clientId      - this tab's own id (see _familyHubClientId below)
-      //   remainingSecondsFn - a (timer) => seconds function, so this
-      //                   singleton reuses the CALLING card's own
-      //                   native-timer-aware math (_timerRemainingSeconds)
-      //                   instead of a second, potentially-drifting copy
-      //                   of it living here with no access to `hass`.
-      // Only a timer whose origin_client_id matches THIS tab's own id and
-      // whose alarm flag is on can ever trigger anything - a timer someone
-      // else started, or one this same tab started but didn't opt into
-      // alarms for, is silently ignored here exactly as before this
-      // feature existed.
+      // From a card's 1-second countdown tick: the tab that started a timer
+      // rings the moment it reaches zero (any timer it started, alarm-style
+      // or not, assigned or not).
       check(timers, clientId, remainingSecondsFn, hass) {
-        if (!clientId) return;
-        const mine = (timers || []).find((t) => t.alarm && t.origin_client_id && t.origin_client_id === clientId);
-        if (!mine || dismissedUids.has(mine.uid)) return;
-        if (remainingSecondsFn(mine) <= 0) start(mine, hass);
+        if (hass) lastHass = hass;
+        const me = clientId || myClientId();
+        if (!me) return;
+        (timers || []).forEach((t) => {
+          if (t && t.origin_client_id && t.origin_client_id === me && !dismissedUids.has(t.uid) && remainingSecondsFn(t) <= 0) {
+            start(t.uid, t.title || "Timer", "", hass);
+          }
+        });
       },
-      // the WIDENED half - a household_timer_alarm_ring bus
-      // event (fired by chores_websocket_api.py's _dispatch_timer_alarm/
-      // _reannounce_active_alarms) that THIS login should also ring for,
-      // because it's either the timer's own owner, a login flagged as an
-      // always-on alarm kiosk, or the tier was "everyone." Unlike check()
-      // above (which only ever recognizes the ONE tab that started the
-      // timer, by origin_client_id), this recognizes a login/account -
-      // every open tab logged in as a matching user rings, on every
-      // dashboard, which is the whole point of the widened tiers. Re-fired
-      // on every re-announcement (see _reannounce_active_alarms), so
-      // calling this again for an already-ringing uid is a deliberate
-      // no-op (start() already short-circuits on activeUid === timer.uid).
+      // The backend's ring event (and list_active_alarms on load).
       ringBroadcast(payload, hass, myUserId) {
         if (!payload || !payload.uid || dismissedUids.has(payload.uid)) return;
         const targets = payload.target_user_ids || [];
-        const shouldRing = !!payload.broadcast_all || (myUserId && targets.includes(myUserId));
+        const fromHere = !!payload.origin_client_id && payload.origin_client_id === myClientId();
+        const shouldRing = !!payload.broadcast_all || fromHere || (myUserId && targets.includes(myUserId));
         if (!shouldRing) return;
-        start({ uid: payload.uid, title: payload.title }, hass);
+        start(payload.uid, payload.timer_title || payload.title, payload.body, hass);
       },
-      // The STOP half of the same broadcast pair - fired the instant
-      // ANY device dismisses (see ws_dismiss_timer_alarm's own "first tap
-      // wins" docstring), including a dismiss that originated from THIS
-      // singleton's own stop() above (that call's own dismiss already
-      // covers this tab; the event still arrives here a moment later and
-      // is a harmless no-op via stop()'s own activeUid !== uid guard, or
-      // via dismissedUids already containing it).
+      // Someone stopped it somewhere else.
       stopFromServer(uid) {
-        if (uid) dismissedUids.add(uid);
-        if (activeUid === uid) stop();
+        if (!uid) return;
+        dismissedUids.add(uid);
+        if (ringing.delete(uid)) {
+          if (!ringing.size && beepHandle) {
+            clearInterval(beepHandle);
+            beepHandle = null;
+          }
+          render();
+        }
+      },
+      _ringing() {
+        return Array.from(ringing.keys());
       },
     };
   })();
@@ -1232,6 +1299,17 @@ class FamilyHubChoresCard extends HTMLElement {
       title: (config && config.title) || "Chores",
       fab_position: config && config.fab_position === "card" ? "card" : "dashboard",
       theme_override: (config && typeof config.theme_override === "string") ? config.theme_override : "",
+      // v1.168.63: which people this card shows at all (Home Assistant user
+      // ids, picked in the card editor's "People on this card" list). Empty
+      // = everyone, same as before this option existed. The person pills
+      // only ever offer people in this list.
+      people: Array.isArray(config && config.people) ? config.people.filter((id) => typeof id === "string" && id) : [],
+      // v1.168.65: Waiting to Recur is now a name pill (it used to be a ↻
+      // header button that collapsed/expanded its column). This switch, on
+      // by default, decides whether this card offers it at all - kept
+      // separate from "people" so a people list saved before this existed
+      // doesn't silently drop it.
+      show_waiting_to_recur: !(config && config.show_waiting_to_recur === false),
     };
     this._registerFabCoordinator();
     if (this._settingsCache === undefined) this._settingsCache = null;
@@ -1328,7 +1406,7 @@ class FamilyHubChoresCard extends HTMLElement {
     try {
       const unsubRing = await this._hass.connection.subscribeEvents((event) => {
         if (window.__familyHubTimerAlarm) {
-          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, myUserId);
+          window.__familyHubTimerAlarm.ringBroadcast(event.data, this._hass, typeof this._myUserId === "function" ? this._myUserId() : myUserId);
         }
       }, "family_hub_timer_alarm_ring");
       const unsubStop = await this._hass.connection.subscribeEvents((event) => {
@@ -1613,17 +1691,31 @@ class FamilyHubChoresCard extends HTMLElement {
     return this._t(`chores.weekday_${idx}`, fallback);
   }
   _ensureTranslationsLoaded() {
+    __fhUseHass(this._hass);
     if (!this._hass || typeof this._hass.loadBackendTranslation !== "function") return;
     const lang = this._baseLanguage(this._hass.language);
-    if (this._i18nLoadedLang === lang || this._i18nLoading === lang) return;
+    if (this._i18nLoadedLang === lang) {
+      // v1.168.67 fix (GitHub issue #10 - "German localization on buttons
+      // only after click on settings"): Home Assistant hands cards the hass
+      // object that actually knows the newly loaded strings a moment AFTER
+      // loadBackendTranslation resolves, so the redraw in .then() below
+      // still ran with the old, English-only localize. Redraw once more
+      // whenever a new localize arrives for the already-loaded language.
+      if (this._hass.localize !== this._i18nLocalize) {
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
+      }
+      return;
+    }
+    if (this._i18nLoading === lang) return;
     this._i18nLoading = lang;
     this._hass
       .loadBackendTranslation("fh_ui", "family_hub")
       .then(() => {
         this._i18nLoadedLang = lang;
         this._i18nLoading = null;
-        this._applyTranslations();
-        this._render();
+        this._i18nLocalize = this._hass.localize;
+        this._onTranslationsReady();
       })
       .catch((e) => {
         this._i18nLoading = null;
@@ -1634,7 +1726,62 @@ class FamilyHubChoresCard extends HTMLElement {
         console.warn("[family_hub] failed to load \"" + lang + "\" translations - staying on English fallback text", e);
       });
   }
+  // v1.168.67 (GitHub issue #10): dates and times follow the Home
+  // Assistant user's own language and time format (Profile > Language /
+  // Time format), not the browser's.
+  _uiLocale() {
+    const h = this._hass;
+    const lang = (h && h.locale && h.locale.language) || (h && h.language) || "";
+    return lang || undefined;
+  }
+  _uiHour12() {
+    const h = this._hass;
+    const tf = h && h.locale && h.locale.time_format;
+    if (tf === "12") return true;
+    if (tf === "24") return false;
+    if (tf === "system") {
+      try {
+        return new Intl.DateTimeFormat(undefined, { hour: "numeric" }).resolvedOptions().hour12;
+      } catch (e) {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+  _fmtDate(d, opts) {
+    try {
+      return d.toLocaleDateString(this._uiLocale(), opts);
+    } catch (e) {
+      return d.toLocaleDateString(undefined, opts);
+    }
+  }
+  _fmtTimeOfDay(d) {
+    const opts = { hour: "numeric", minute: "2-digit" };
+    const hour12 = this._uiHour12();
+    if (hour12 !== undefined) opts.hour12 = hour12;
+    try {
+      return d.toLocaleTimeString(this._uiLocale(), opts);
+    } catch (e) {
+      return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    }
+  }
+  _fmtDateTime(d) {
+    const opts = { year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" };
+    const hour12 = this._uiHour12();
+    if (hour12 !== undefined) opts.hour12 = hour12;
+    try {
+      return d.toLocaleString(this._uiLocale(), opts);
+    } catch (e) {
+      return d.toLocaleString();
+    }
+  }
+  // Redraws everything that shows translated text.
+  _onTranslationsReady() {
+    this._applyTranslations();
+    this._render();
+  }
   _applyTranslations() {
+    __fhSweep(this._root || this.shadowRoot);
     if (!this._root) return;
     this._root.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.dataset.i18n;
@@ -1709,7 +1856,7 @@ class FamilyHubChoresCard extends HTMLElement {
       if (!this._kioskLoginUsers.length) {
         const empty = document.createElement("div");
         empty.className = "kiosk-login-empty";
-        empty.textContent = "No one is set up for kiosk login yet - an admin can enable it under Settings > Users.";
+        empty.textContent = __fhT("text.no_one_is_set_up_for_kiosk_login_yet_an", "No one is set up for kiosk login yet - an admin can enable it under Settings > Users.");
         pickerEl.appendChild(empty);
       } else {
         this._kioskLoginUsers.forEach((u) => {
@@ -1743,11 +1890,11 @@ class FamilyHubChoresCard extends HTMLElement {
     const userId = this._kioskLoginSelectedUserId;
     const pin = pinEl ? pinEl.value.trim() : "";
     if (!userId) {
-      if (errEl) errEl.textContent = "Pick who's logging in first.";
+      if (errEl) errEl.textContent = __fhT("text.pick_who_s_logging_in_first", "Pick who's logging in first.");
       return;
     }
     if (!pin) {
-      if (errEl) errEl.textContent = "Enter a PIN.";
+      if (errEl) errEl.textContent = __fhT("text.enter_a_pin", "Enter a PIN.");
       return;
     }
     try {
@@ -1761,7 +1908,7 @@ class FamilyHubChoresCard extends HTMLElement {
       await window.__familyHubKioskSession.login(this._hass, userId, pin);
       this._closeKioskLoginModal();
     } catch (e) {
-      if (errEl) errEl.textContent = (e && e.message) || "Incorrect PIN.";
+      if (errEl) errEl.textContent = (e && e.message) || __fhT("text.incorrect_pin", "Incorrect PIN.");
       if (pinEl) {
         pinEl.value = "";
         pinEl.focus();
@@ -1966,7 +2113,7 @@ class FamilyHubChoresCard extends HTMLElement {
     // that has never (re-)saved Settings since the "turn it on by default"
     // change actually gets confetti by default, not just once someone
     // happens to open and save that one settings screen.
-    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "liquidglass", choresConfettiOnComplete: true };
+    return { theme: this._defaultTheme(), useGlobalTheme: true, globalThemeId: "slate", choresConfettiOnComplete: true };
   }
   _getSettings() {
     return this._settingsCache || this._defaultSettings();
@@ -2008,7 +2155,7 @@ class FamilyHubChoresCard extends HTMLElement {
     // _resolveTheme already applies for its own global-theme branch.
     const cardOpacity = typeof g.cardOpacity === "number" ? g.cardOpacity : 100;
     const glassBlur = typeof g.glassBlur === "number" ? g.glassBlur : 0;
-    return { colors, cardOpacity, glassBlur };
+    return { colors, cardOpacity, glassBlur, background: g.background || null };
   }
   _resolveTheme(settings) {
     const local = settings.theme || this._defaultTheme();
@@ -2051,6 +2198,17 @@ class FamilyHubChoresCard extends HTMLElement {
     if (deviceOverride) return `device:${deviceOverride}`;
     return "household";
   }
+  _fhThemeBgVars(bg) {
+    const img = bg && typeof bg.image === "string" && bg.image ? bg.image : "";
+    if (!img) return { "--fc-bg-image": "none", "--fc-bg-overlay-image": "none", "--fc-bg-size": "cover", "--fc-bg-position": "center" };
+    const ov = this._hexToRgba(/^#[0-9a-fA-F]{6}$/.test(bg.overlayColor || "") ? bg.overlayColor : "#000000", Number(bg.overlayOpacity) || 0);
+    return {
+      "--fc-bg-image": `url("${img.replace(/"/g, '\\"')}")`,
+      "--fc-bg-overlay-image": `linear-gradient(${ov}, ${ov})`,
+      "--fc-bg-size": bg.size === "repeat" ? "auto" : bg.size || "cover",
+      "--fc-bg-position": bg.position || "center",
+    };
+  }
   _applyThemeVars() {
     const theme = this._resolveTheme(this._getSettings());
     // same "liquid glass" support family-week-calendar-card.js has
@@ -2079,6 +2237,14 @@ class FamilyHubChoresCard extends HTMLElement {
       "--fc-surface2": this._hexToRgba(theme.colors.surface2, cardOpacity / 100),
       "--fc-glass-blur": `${glassBlur}px`,
     };
+        // v1.168.79 - the theme's own background image (the Liquid Glass
+    // aurora, or any image a theme sets in Theme Builder) now paints
+    // behind this card too, not just the calendar/Today cards - without
+    // it a glass theme's translucent surfaces only had a flat color to
+    // show through, so nothing looked like glass. Always set (to "none"
+    // when there's no image) so a cached earlier theme can't leave a
+    // stale image behind.
+    Object.assign(vars, this._fhThemeBgVars(theme.background));
     Object.keys(vars).forEach((name) => this.style.setProperty(name, vars[name]));
     if (window.__familyHubThemeCache) window.__familyHubThemeCache.set(this._familyHubThemeCacheKey(), vars);
   }
@@ -2392,7 +2558,7 @@ class FamilyHubChoresCard extends HTMLElement {
       // Surfaced rather than swallowed - the realistic failures here are
       // "you've already got a chore timer running" and "that's not your
       // chore," both of which the person needs to be told about.
-      window.alert((e && e.message) || "Couldn't start that timer.");
+      window.alert((e && e.message) || __fhT("text.couldn_t_start_that_timer", "Couldn't start that timer."));
     }
     await this._fetchTimers();
     this._render();
@@ -2611,7 +2777,7 @@ class FamilyHubChoresCard extends HTMLElement {
       await this._hass.connection.sendMessagePromise(this._kioskMsg({ type: "family_hub/rewards/redeem", item_id: itemId }));
       await this._fetchRewardsState();
     } catch (e) {
-      if (statusEl) statusEl.textContent = "Not enough stars yet.";
+      if (statusEl) statusEl.textContent = __fhT("text.not_enough_stars_yet", "Not enough stars yet.");
     }
   }
   // memberUserIds lives on the Settings blob (see const.py's
@@ -2682,11 +2848,12 @@ class FamilyHubChoresCard extends HTMLElement {
         <div class="header">
           <div class="title"></div>
           <div class="actions">
-            <button class="waiting-recur-toggle-btn" title="Show Waiting to Recur as a column" data-i18n-title="chores.waiting_recur_show">&#8635; <span class="waiting-recur-toggle-count"></span></button>
+            <button class="compact-view-toggle-btn" title="Switch to compact view" data-i18n-title="chores.compact_view_show">&#9776;</button>
             <button class="rewards-toggle-btn" title="Show/hide the Rewards column" data-i18n-title="chores.rewards_toggle_title" hidden>&#11088;</button>
             <button class="kiosk-login-btn" title="Log in as a specific household member on this kiosk display" data-i18n-title="chores.kiosk_login_title" hidden>&#128274; <span data-i18n="chores.login">Login</span></button>
           </div>
         </div>
+        <div class="person-pills" hidden></div>
         <div class="board"></div>
       </ha-card>
       <div class="modal-overlay create-modal"><div class="modal-box"></div></div>
@@ -2722,7 +2889,7 @@ class FamilyHubChoresCard extends HTMLElement {
     // the true viewport like the calendar card's FAB already does.
     root.querySelector(".add-chore-fab").addEventListener("click", () => this._openCreateModal());
     root.querySelector(".rewards-toggle-btn").addEventListener("click", () => this._toggleRewardsColumn());
-    root.querySelector(".waiting-recur-toggle-btn").addEventListener("click", () => this._toggleWaitingToRecurCollapsed());
+    root.querySelector(".compact-view-toggle-btn").addEventListener("click", () => this._toggleCompactView());
     root.querySelectorAll(".modal-overlay").forEach((ov) => {
       ov.addEventListener("click", (e) => {
         if (e.target === ov) ov.classList.remove("open");
@@ -2760,6 +2927,12 @@ class FamilyHubChoresCard extends HTMLElement {
     if (timerCancelBtn) {
       e.stopPropagation();
       this._cancelTimer(timerCancelBtn.dataset.uid);
+      return;
+    }
+    const inProgressBtn = e.target.closest(".chore-in-progress-btn");
+    if (inProgressBtn) {
+      e.stopPropagation();
+      this._setChoreInProgress(inProgressBtn.dataset.id, inProgressBtn.dataset.next === "1");
       return;
     }
     const nudgeBtn = e.target.closest(".chore-nudge-btn");
@@ -2864,12 +3037,12 @@ class FamilyHubChoresCard extends HTMLElement {
     const overlay = this._root.querySelector(".reject-modal");
     const box = overlay.querySelector(".modal-box");
     box.innerHTML = `
-      <button type="button" class="modal-close reject-modal-close" aria-label="Close">&#10005;</button>
-      <h2>Send back "${this._esc(item.title)}"</h2>
-      <div class="field"><label>Anything you want to tell them about why? (optional)</label><textarea class="f-reject-reason" rows="3" placeholder="Not quite - try again"></textarea></div>
+      <button data-fh-aria="text.close" type="button" class="modal-close reject-modal-close" aria-label="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
+      <h2>${__fhT("text.send_back_x", "Send back \"%0%\"", {0: this._esc(item.title)}, "h")}</h2>
+      <div class="field"><label data-fh-t="text.anything_you_want_to_tell_them_about">${__fhT("text.anything_you_want_to_tell_them_about", "Anything you want to tell them about why? (optional)", null, "h")}</label><textarea data-fh-placeholder="text.not_quite_try_again" class="f-reject-reason" rows="3" placeholder="${__fhT("text.not_quite_try_again", "Not quite - try again", null, "h")}"></textarea></div>
       <div class="modal-actions">
-        <button class="cancel-btn">Cancel</button>
-        <button class="save-btn">Send back</button>
+        <button data-fh-t="text.cancel" class="cancel-btn">${__fhT("text.cancel", "Cancel", null, "h")}</button>
+        <button data-fh-t="text.send_back" class="save-btn">${__fhT("text.send_back", "Send back", null, "h")}</button>
       </div>
     `;
     box.querySelector(".reject-modal-close").addEventListener("click", () => overlay.classList.remove("open"));
@@ -2905,6 +3078,16 @@ class FamilyHubChoresCard extends HTMLElement {
       /* no-op */
     }
   }
+  async _setChoreInProgress(id, inProgress) {
+    try {
+      await this._hass.connection.sendMessagePromise(
+        this._kioskMsg({ type: "family_hub/chores/set_in_progress", chore_id: id, in_progress: inProgress })
+      );
+      await this._fetchChores();
+    } catch (e) {
+      /* server already reports the reason via send_error; next poll/render corrects the button either way */
+    }
+  }
   async _assign(id, target) {
     try {
       await this._hass.connection.sendMessagePromise({ type: "family_hub/chores/assign", chore_id: id, target });
@@ -2922,6 +3105,110 @@ class FamilyHubChoresCard extends HTMLElement {
   // existing work (left alone on purpose - not force-reassigned, see
   // const.py) never silently disappears from view instead of just no
   // longer collecting new ones.
+  // v1.168.62: calendar-style person pills across the top - household ask:
+  // "make the chores and rewards card able to have the pill style names
+  // across the top just like the calendar does so you can select exactly
+  // who you want to show or not show." Same rules as the calendar legend
+  // chips: nobody selected = everyone shows; tap people to show only them
+  // (the rest dim); tap again to turn one off. Unlike the calendar's
+  // session-only filter this one is remembered on this device, per
+  // dashboard view (location.pathname), so a wall tablet showing "just the
+  // kids" stays that way across reloads. Ids that no longer exist are
+  // ignored, so a removed person can never leave the board blank.
+  // v1.168.63: narrows a list of people to the card editor's "People on
+  // this card" choice (config.people). If none of the chosen ids exist any
+  // more (everyone picked was removed from the household), shows everyone
+  // rather than an empty card.
+  // v1.168.66: "me" in that list means whoever is signed in right now -
+  // the kiosk PIN-logged-in person when there is one (see _myUserId), so
+  // one card on a shared tablet follows whoever logs in. Unlike a fixed
+  // list, "me" never falls back to everyone: someone who isn't on the
+  // card (a kiosk login before anyone PIN-logs in, a guest) sees only the
+  // rest of the list (e.g. the Chore Bin), or a short note.
+  _configuredPeopleIds() {
+    const chosen = (this._config && Array.isArray(this._config.people)) ? this._config.people : [];
+    const me = this._myUserId();
+    return chosen.map((id) => (id === "me" ? me : id)).filter((id) => typeof id === "string" && id);
+  }
+  _isJustMeCard() {
+    return !!(this._config && Array.isArray(this._config.people) && this._config.people.includes("me"));
+  }
+  _limitToConfiguredPeople(items, idOf) {
+    const chosen = (this._config && Array.isArray(this._config.people)) ? this._config.people : [];
+    if (!chosen.length) return items;
+    const ids = this._configuredPeopleIds();
+    const kept = items.filter((it) => ids.includes(idOf(it)));
+    if (kept.length || this._isJustMeCard()) return kept;
+    return items;
+  }
+  _personFilterStorageKey() {
+    let path = "";
+    try {
+      path = (window.location && window.location.pathname) || "";
+    } catch (e) {
+      path = "";
+    }
+    return `familyHubPersonFilter:chores:${path}`;
+  }
+  _personFilterIds() {
+    if (!Array.isArray(this._personFilter)) {
+      let saved = [];
+      try {
+        const raw = localStorage.getItem(this._personFilterStorageKey());
+        const parsed = raw ? JSON.parse(raw) : [];
+        saved = Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string" && id) : [];
+      } catch (e) {
+        saved = [];
+      }
+      this._personFilter = saved;
+    }
+    return this._personFilter;
+  }
+  // The filter actually in effect for this set of people: only ids that
+  // still exist count, and if none of them do, it's "show everyone".
+  _activePersonFilter(knownIds) {
+    const known = new Set(knownIds);
+    return this._personFilterIds().filter((id) => known.has(id));
+  }
+  _togglePersonFilter(id) {
+    const list = this._personFilterIds().slice();
+    const at = list.indexOf(id);
+    if (at === -1) list.push(id);
+    else list.splice(at, 1);
+    this._personFilter = list;
+    try {
+      localStorage.setItem(this._personFilterStorageKey(), JSON.stringify(list));
+    } catch (e) {
+      // per-device convenience only - the filter still works this session
+    }
+    this._render();
+  }
+  // pills: [{ id, name, color, count }] - drawn into .person-pills. Hidden
+  // when there's only one person (nothing to choose between).
+  _renderPersonPills(pills) {
+    const el = this._root && this._root.querySelector(".person-pills");
+    if (!el) return;
+    if (!Array.isArray(pills) || pills.length < 2) {
+      el.innerHTML = "";
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+    const active = this._activePersonFilter(pills.map((p) => p.id));
+    const esc = (v) => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    el.innerHTML = pills
+      .map((p) => {
+        const isActive = active.includes(p.id);
+        const isDimmed = active.length > 0 && !isActive;
+        const initial = (String(p.name || "?").trim().charAt(0) || "?").toUpperCase();
+        return `<button type="button" class="person-pill${isActive ? " active-filter" : ""}${isDimmed ? " dimmed" : ""}" data-person-id="${esc(p.id)}" aria-pressed="${isActive ? "true" : "false"}" style="background:${esc(p.color)}"><span class="person-pill-avatar">${esc(initial)}</span>${esc(p.name)}${p.count !== undefined && p.count !== null && p.count !== "" ? ` <span class="person-pill-count">${esc(p.count)}</span>` : ""}</button>`;
+      })
+      .join("");
+    el.querySelectorAll(".person-pill").forEach((btn) => {
+      btn.addEventListener("click", () => this._togglePersonFilter(btn.dataset.personId));
+    });
+  }
+
   _columns() {
     const memberIds = new Set(this._memberUsers().map((u) => u.id));
     const hasOutstandingChore = (userId) =>
@@ -3034,7 +3321,7 @@ class FamilyHubChoresCard extends HTMLElement {
     // chore - a purely sensor-triggered one has no predictable date, so it
     // just says it's waiting on the trigger instead of a next-due date it
     // can't actually know.
-    const nextDateStr = chore.recur_next_due ? new Date(chore.recur_next_due).toLocaleDateString() : "";
+    const nextDateStr = chore.recur_next_due ? this._fmtDate(new Date(chore.recur_next_due)) : "";
     const next = chore.recur_next_due
       ? this._t("chores.next_x", `Next: ${nextDateStr}`, { x: nextDateStr })
       : (chore.auto_create_trigger ? this._t("chores.waiting_for_trigger", "Waiting for the trigger to fire") : "");
@@ -3052,29 +3339,27 @@ class FamilyHubChoresCard extends HTMLElement {
       </div>
     `;
   }
-  // Always INCLUDED (this data is never opt-in, unlike the Rewards
-  // column), but how it's DISPLAYED is a per-device, space-saving choice -
-  // full column (the original behavior, and still the default) or
-  // collapsed into a single header-bar button on a smaller screen where a
-  // whole extra column is a lot to spend on something that's often empty.
-  // A plain localStorage flag rather than a Settings field on purpose: two
-  // people looking at the same household's board on different devices (a
-  // wall tablet vs. a phone) reasonably want different answers here, and
-  // unlike e.g. choresShowRewardsColumn this never changes what data
-  // exists, only how much room this one device gives it - see
-  // _waitingToRecurColumnHtml/the .waiting-recur-toggle-btn wiring in
-  // _render() for the two display modes.
-  _waitingToRecurCollapsed() {
+  // (v1.168.65: the old per-device "collapse Waiting to Recur to a header
+  // button" flag - localStorage familyHubChoresWaitingToRecurBar - is gone;
+  // Waiting to Recur is a name pill now, see _render.)
+  // Household ask, verbatim: "If there are so many chores on a list that
+  // they turn into a scrolling list, maybe we should have a more compact
+  // view." Same "per-device display choice, not a Settings field" shape
+  // as the other per-device display flags here (a wall tablet and a phone
+  // reasonably want different answers), and the same localStorage-flag
+  // mechanism - this never hides/changes any chore data, only how much
+  // vertical room each card takes (see .board.compact-view in _css()).
+  _compactViewEnabled() {
     try {
-      return window.localStorage.getItem("familyHubChoresWaitingToRecurBar") === "on";
+      return window.localStorage.getItem("familyHubChoresCompactView") === "on";
     } catch (e) {
       return false;
     }
   }
-  _toggleWaitingToRecurCollapsed() {
-    const next = !this._waitingToRecurCollapsed();
+  _toggleCompactView() {
+    const next = !this._compactViewEnabled();
     try {
-      window.localStorage.setItem("familyHubChoresWaitingToRecurBar", next ? "on" : "off");
+      window.localStorage.setItem("familyHubChoresCompactView", next ? "on" : "off");
     } catch (e) {
       /* no-op - this device just won't remember the choice across reloads */
     }
@@ -3516,7 +3801,7 @@ class FamilyHubChoresCard extends HTMLElement {
     if (!dueDateIso) return "";
     const d = new Date(dueDateIso);
     const hasTime = d.getHours() !== 0 || d.getMinutes() !== 0;
-    return hasTime ? d.toLocaleString() : d.toLocaleDateString();
+    return hasTime ? this._fmtDateTime(d) : this._fmtDate(d);
   }
   _choreCardHtml(chore) {
     const status = chore.status;
@@ -3551,6 +3836,18 @@ class FamilyHubChoresCard extends HTMLElement {
         actions += `<button class="chore-timer-start-btn" data-id="${chore.id}" title="${this._t("chores.start_timer_title", "Start the timer - this chore finishes itself when it runs out")}">&#9654; ${this._t("chores.start_n", `Start (${this._formatTimerLength(timerMinutes)})`, { n: this._formatTimerLength(timerMinutes) })}</button>`;
       }
       actions += `<button class="chore-done-btn" data-id="${chore.id}">${doneLabel}</button>`;
+      // Household ask, verbatim: "Chores should have a button to Mark in
+      // progress also." A lightweight, reversible flag (see
+      // chore_engine.set_chore_in_progress's own docstring) - not a new
+      // column/status, just a toggle on the card itself. Hidden on a
+      // running timer (the timer already IS "in progress," visibly
+      // counting down) to avoid two different "I'm working on it"
+      // indicators competing for the same spot.
+      if (!runningTimer) {
+        actions += chore.in_progress
+          ? `<button class="chore-in-progress-btn is-active" data-id="${chore.id}" data-next="0" title="${this._t("chores.in_progress_title", "Someone's working on this - tap to clear")}">&#9203; ${this._t("chores.in_progress", "In progress")}</button>`
+          : `<button class="chore-in-progress-btn" data-id="${chore.id}" data-next="1" title="${this._t("chores.mark_in_progress_title", "Let the household know you're working on this")}">${this._t("chores.mark_in_progress", "Mark in progress")}</button>`;
+      }
       actions += `<button class="chore-nudge-btn" data-id="${chore.id}" title="${this._t("chores.nudge", "Nudge")}">&#128276;</button>`;
     } else if (status === "open" && isBin) {
       // used to be gated to assignment_mode === "first_come_first_
@@ -3653,7 +3950,7 @@ class FamilyHubChoresCard extends HTMLElement {
     box.innerHTML = `
       <div class="detail-header">
         <span class="detail-status-badge">${this._esc(this._statusLabel(chore))}</span>
-        <button type="button" class="detail-close-btn" title="Close">&#10005;</button>
+        <button data-fh-title="text.close" type="button" class="detail-close-btn" title="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
       </div>
       <h3 class="detail-title">${this._esc(chore.title)}</h3>
       <div class="detail-row">
@@ -3662,13 +3959,13 @@ class FamilyHubChoresCard extends HTMLElement {
       </div>
       <div class="detail-stats">
         <span class="detail-stat">&#11088; ${chore.star_value || 0} star${chore.star_value === 1 ? "" : "s"}</span>
-        ${due ? `<span class="detail-stat">&#128197; Due ${this._esc(due)}</span>` : ""}
-        ${chore.overdue_penalty ? `<span class="detail-stat">&#9888; -${chore.overdue_penalty} if overdue</span>` : ""}
+        ${due ? `<span class="detail-stat">${__fhT("text.due_x", "📅 Due %0%", {0: this._esc(due)}, "h")}</span>` : ""}
+        ${chore.overdue_penalty ? `<span class="detail-stat">${__fhT("text.x_if_overdue", "⚠ -%0% if overdue", {0: chore.overdue_penalty}, "h")}</span>` : ""}
         ${chore.streak_count > 0 ? `<span class="detail-stat">&#128293; ${chore.streak_count} streak</span>` : ""}
         ${chore.quantity_total ? `<span class="detail-stat">&#128203; ${chore.quantity_remaining == null ? chore.quantity_total : chore.quantity_remaining}/${chore.quantity_total} left</span>` : ""}
       </div>
-      ${recurHtml ? `<div class="detail-recur">&#128260; Recurs: ${recurHtml}</div>` : ""}
-      ${deps.length ? `<div class="detail-section-label">Waiting on</div><div class="detail-deps">${deps.join("")}</div>` : ""}
+      ${recurHtml ? `<div class="detail-recur">${__fhT("text.recurs_x", "🔄 Recurs: %0%", {0: recurHtml}, "h")}</div>` : ""}
+      ${deps.length ? `<div data-fh-t="text.waiting_on" class="detail-section-label">${__fhT("text.waiting_on", "Waiting on", null, "h")}</div><div class="detail-deps">${deps.join("")}</div>` : ""}
       ${
         // full feedback for a chore currently sitting in its
         // reject_chore redo window - see const.py's CHORE_KEY_REJECT_REASON
@@ -3676,15 +3973,15 @@ class FamilyHubChoresCard extends HTMLElement {
         // "Sent back" badge (see _choreCardHtml); this is where the actual
         // reason (if one was given) is readable in full.
         chore.status === "open" && chore.rejected_by
-          ? `<div class="detail-section-label">Sent back</div><div class="detail-rejected-note">${chore.reject_reason ? this._esc(chore.reject_reason) : "No reason given."}</div>`
+          ? `<div data-fh-t="text.sent_back" class="detail-section-label">${__fhT("text.sent_back", "Sent back", null, "h")}</div><div class="detail-rejected-note">${chore.reject_reason ? this._esc(chore.reject_reason) : __fhT("text.no_reason_given", "No reason given.", null, "h")}</div>`
           : ""
       }
-      <div class="detail-section-label">Notes</div>
-      <div class="detail-notes ${notes ? "" : "empty"}">${notes ? this._esc(notes) : "No notes added."}</div>
+      <div data-fh-t="text.notes" class="detail-section-label">${__fhT("text.notes", "Notes", null, "h")}</div>
+      <div class="detail-notes ${notes ? "" : "empty"}">${notes ? this._esc(notes) : __fhT("text.no_notes_added", "No notes added.", null, "h")}</div>
       <div class="modal-actions">
-        ${chore.status === "open" && this._canEditChore() ? `<button type="button" class="detail-edit-btn">Edit</button>` : ""}
-        ${this._isAdmin() ? `<button type="button" class="detail-delete-btn">Delete</button>` : ""}
-        <button type="button" class="detail-close-btn-2">Close</button>
+        ${chore.status === "open" && this._canEditChore() ? `<button data-fh-t="text.edit" type="button" class="detail-edit-btn">${__fhT("text.edit", "Edit", null, "h")}</button>` : ""}
+        ${this._isAdmin() ? `<button data-fh-t="text.delete" type="button" class="detail-delete-btn">${__fhT("text.delete", "Delete", null, "h")}</button>` : ""}
+        <button data-fh-t="text.close" type="button" class="detail-close-btn-2">${__fhT("text.close", "Close", null, "h")}</button>
       </div>
     `;
     const close = () => overlay.classList.remove("open");
@@ -3708,11 +4005,11 @@ class FamilyHubChoresCard extends HTMLElement {
     const deleteBtn = box.querySelector(".detail-delete-btn");
     if (deleteBtn) {
       deleteBtn.addEventListener("click", async () => {
-        if (!window.confirm(`Delete "${chore.title}"? This can't be undone.`)) return;
+        if (!window.confirm(__fhT("text.delete_x_this_can_t_be_undone", "Delete \"%0%\"? This can't be undone.", {0: chore.title}))) return;
         try {
           await this._hass.connection.sendMessagePromise({ type: "family_hub/chores/delete", chore_id: choreId });
         } catch (e) {
-          window.alert((e && e.message) || "Couldn't delete this chore.");
+          window.alert((e && e.message) || __fhT("text.couldn_t_delete_this_chore", "Couldn't delete this chore."));
           return;
         }
         close();
@@ -3787,8 +4084,29 @@ class FamilyHubChoresCard extends HTMLElement {
     if (!this._root) return;
     this._root.querySelector(".title").textContent = this._config.title;
     const board = this._root.querySelector(".board");
-    const columns = this._columns();
-    board.innerHTML = columns
+    // v1.168.62: person pills - see _renderPersonPills. Every column (each
+    // member plus the Chore Bin) gets a pill with its open-chore count;
+    // only the selected ones are drawn (all of them when none is selected).
+    const allColumns = this._limitToConfiguredPeople(this._columns(), (col) => col.id);
+    const openCount = (colId) => this._chores.filter((c) => c.assigned_to === colId && !this._isWaitingToRecur(c) && c.status !== "approved").length;
+    // v1.168.65: Waiting to Recur is its own pill at the end of the row
+    // (household ask: move it "to the pill style") instead of the old ↻
+    // header button - same rules as every other pill.
+    const waitingEntry = this._config.show_waiting_to_recur
+      ? [{ id: WAITING_TO_RECUR_PILL_ID, name: `\u21BB ${this._t("chores.waiting_to_recur_col", "Waiting to Recur")}`, color: "#8fa7b3", count: this._chores.filter((c) => this._isWaitingToRecur(c)).length }]
+      : [];
+    const pillEntries = allColumns.map((col) => ({ id: col.id, name: col.name, color: col.color, count: openCount(col.id) })).concat(waitingEntry);
+    this._renderPersonPills(pillEntries);
+    const shownIds = this._activePersonFilter(pillEntries.map((e) => e.id));
+    const columns = shownIds.length ? allColumns.filter((col) => shownIds.includes(col.id)) : allColumns;
+    const showWaitingColumn = waitingEntry.length > 0 && (!shownIds.length || shownIds.includes(WAITING_TO_RECUR_PILL_ID));
+    // v1.168.66: a "Just me" card with nobody to show for this login
+    // (e.g. a shared kiosk before anyone logs in with their PIN) says so
+    // instead of leaving the board blank.
+    const justMeNote = !columns.length && this._isJustMeCard()
+      ? `<div class="just-me-empty">${this._esc(this._t("chores.just_me_empty", "This card shows whoever is signed in. Sign in (or log in with your PIN) as someone in the household to see your chores."))}</div>`
+      : "";
+    board.innerHTML = justMeNote + columns
       .map((col) => {
         // Excludes anything now sitting in the dedicated Waiting to Recur
         // column (see _isWaitingToRecur) - once a recurring chore is
@@ -3829,7 +4147,7 @@ class FamilyHubChoresCard extends HTMLElement {
           </div>
         `;
       })
-      .join("") + (this._waitingToRecurCollapsed() ? "" : this._waitingToRecurColumnHtml()) + (this._showRewardsColumn() ? this._rewardsColumnHtml() : "");
+      .join("") + (showWaitingColumn ? this._waitingToRecurColumnHtml() : "") + (this._showRewardsColumn() ? this._rewardsColumnHtml() : "");
 
     if (this._canAssign()) this._attachDragHandlers();
     // Was plain _canAssign() - broadened to _canManageAnyRoutines()
@@ -3850,14 +4168,13 @@ class FamilyHubChoresCard extends HTMLElement {
       rewardsToggleBtn.classList.toggle("active", this._showRewardsColumn());
       rewardsToggleBtn.title = this._showRewardsColumn() ? this._t("chores.hide_rewards_column", "Hide the Rewards column") : this._t("chores.show_rewards_column", "Show the Rewards column");
     }
-    const waitingToggleBtn = this._root.querySelector(".waiting-recur-toggle-btn");
-    if (waitingToggleBtn) {
-      const collapsed = this._waitingToRecurCollapsed();
-      const waitingCount = this._chores.filter((c) => this._isWaitingToRecur(c)).length;
-      waitingToggleBtn.classList.toggle("active", collapsed);
-      waitingToggleBtn.title = collapsed ? this._t("chores.waiting_recur_show", "Show Waiting to Recur as a column") : this._t("chores.waiting_recur_collapse", "Collapse Waiting to Recur to a button");
-      waitingToggleBtn.querySelector(".waiting-recur-toggle-count").textContent = String(waitingCount);
+    const compactToggleBtn = this._root.querySelector(".compact-view-toggle-btn");
+    if (compactToggleBtn) {
+      const compact = this._compactViewEnabled();
+      compactToggleBtn.classList.toggle("active", compact);
+      compactToggleBtn.title = compact ? this._t("chores.compact_view_hide", "Switch to the full view") : this._t("chores.compact_view_show", "Switch to compact view");
     }
+    this._root.querySelector(".board").classList.toggle("compact-view", this._compactViewEnabled());
   }
 
   _attachDragHandlers() {
@@ -3978,31 +4295,31 @@ class FamilyHubChoresCard extends HTMLElement {
       { value: "custom", label: "Custom..." },
     ].map((o) => `<option value="${o.value}" ${presetValue === o.value ? "selected" : ""}>${o.label}</option>`).join("");
     return `
-      <label>Recurs
+      <label>${__fhT("text.recurs", "Recurs", null, "h")}
         <select class="f-recur-preset" data-anchor-weekday="${anchorInfo.weekday}" data-anchor-nth="${anchorInfo.nth}">${presetOptions}</select>
       </label>
       <div class="field f-recur-custom-panel">
-        <label>Custom recurrence
+        <label>${__fhT("text.custom_recurrence", "Custom recurrence", null, "h")}
           <select class="f-recur-type">
-            <option value="" ${recurType === "" ? "selected" : ""}>Doesn't repeat on its own schedule</option>
-            <option value="interval" ${recurType === "interval" ? "selected" : ""}>Every few days/weeks/months</option>
-            <option value="weekdays" ${recurType === "weekdays" ? "selected" : ""}>Specific days of the week</option>
-            <option value="monthly_nth" ${recurType === "monthly_nth" ? "selected" : ""}>A specific week each month (e.g. the 3rd Wednesday)</option>
+            <option data-fh-t="text.doesn_t_repeat_on_its_own_schedule" value="" ${recurType === "" ? "selected" : ""}>${__fhT("text.doesn_t_repeat_on_its_own_schedule", "Doesn't repeat on its own schedule", null, "h")}</option>
+            <option data-fh-t="text.every_few_days_weeks_months" value="interval" ${recurType === "interval" ? "selected" : ""}>${__fhT("text.every_few_days_weeks_months", "Every few days/weeks/months", null, "h")}</option>
+            <option data-fh-t="text.specific_days_of_the_week" value="weekdays" ${recurType === "weekdays" ? "selected" : ""}>${__fhT("text.specific_days_of_the_week", "Specific days of the week", null, "h")}</option>
+            <option data-fh-t="text.a_specific_week_each_month_e_g_the_3rd" value="monthly_nth" ${recurType === "monthly_nth" ? "selected" : ""}>${__fhT("text.a_specific_week_each_month_e_g_the_3rd", "A specific week each month (e.g. the 3rd Wednesday)", null, "h")}</option>
           </select>
         </label>
-        <label class="f-recur-interval-field">Repeat every <input type="number" class="f-recur-interval" min="1" value="${interval}"> <select class="f-recur-interval-unit">${intervalUnitOptions}</select></label>
+        <label class="f-recur-interval-field">${__fhT("text.repeat_every", "Repeat every", null, "h")} <input type="number" class="f-recur-interval" min="1" value="${interval}"> <select class="f-recur-interval-unit">${intervalUnitOptions}</select></label>
         <div class="field f-recur-weekdays-field">
-          <label>On these days</label>
+          <label data-fh-t="text.on_these_days">${__fhT("text.on_these_days", "On these days", null, "h")}</label>
           <div class="weekday-btn-row">${weekdayBtns}</div>
         </div>
         <div class="field f-recur-monthly-field">
-          <label>Which week<select class="f-recur-month-nth">${nthOptions}</select></label>
-          <label>On these days</label>
+          <label>${__fhT("text.which_week", "Which week", null, "h")}<select class="f-recur-month-nth">${nthOptions}</select></label>
+          <label data-fh-t="text.on_these_days">${__fhT("text.on_these_days", "On these days", null, "h")}</label>
           <div class="weekday-btn-row">${monthlyWeekdayBtns}</div>
-          <button type="button" class="recur-quickpick-btn f-recur-first-weekend">First weekend of the month</button>
+          <button data-fh-t="text.first_weekend_of_the_month" type="button" class="recur-quickpick-btn f-recur-first-weekend">${__fhT("text.first_weekend_of_the_month", "First weekend of the month", null, "h")}</button>
         </div>
       </div>
-      <label class="f-recur-due-offset-field">Due<select class="f-recur-due-offset">${dueOffsetOptions}</select>after it recurs</label>
+      <label class="f-recur-due-offset-field">${__fhT("text.due", "Due", null, "h")}<select class="f-recur-due-offset">${dueOffsetOptions}</select>${__fhT("text.after_it_recurs", "after it recurs", null, "h")}</label>
     `;
   }
   // Which occurrence-of-the-weekday-in-its-month `date` is (1st/2nd/3rd/
@@ -4158,7 +4475,7 @@ class FamilyHubChoresCard extends HTMLElement {
       })
       .join("");
     return `
-      <label class="f-remind-field">Remind me
+      <label class="f-remind-field">${__fhT("text.remind_me", "Remind me", null, "h")}
         <div class="f-remind-row">${optionsHtml}</div>
       </label>
     `;
@@ -4214,24 +4531,24 @@ class FamilyHubChoresCard extends HTMLElement {
     // Routine instead (see _wireModalTabs below for the matching default-
     // active-tab change).
     const routineOnly = !this._canAssign() && this._canManageAnyRoutines();
-    const routineTab = this._routinesEnabled() ? `<button type="button" class="modal-tab${routineOnly ? " active" : ""}" data-tab="routine">Routine</button>` : "";
+    const routineTab = this._routinesEnabled() ? `<button data-fh-t="text.routine" type="button" class="modal-tab${routineOnly ? " active" : ""}" data-tab="routine">${__fhT("text.routine", "Routine", null, "h")}</button>` : "";
     const choreGoalTabsHtml = routineOnly
       ? ""
       : `
-        <button type="button" class="modal-tab active" data-tab="chore">Chore</button>
-        <button type="button" class="modal-tab" data-tab="goal">Goal</button>
+        <button data-fh-t="text.chore" type="button" class="modal-tab active" data-tab="chore">${__fhT("text.chore", "Chore", null, "h")}</button>
+        <button data-fh-t="text.goal" type="button" class="modal-tab" data-tab="goal">${__fhT("text.goal", "Goal", null, "h")}</button>
       `;
     box.innerHTML = `
-      <button type="button" class="modal-close create-modal-close" aria-label="Close">&#10005;</button>
-      <h2 class="chore-modal-heading">&#10133; New</h2>
+      <button data-fh-aria="text.close" type="button" class="modal-close create-modal-close" aria-label="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
+      <h2 data-fh-t="text.new" class="chore-modal-heading">${__fhT("text.new", "➕ New", null, "h")}</h2>
       <div class="modal-tabs">
         ${choreGoalTabsHtml}
         ${routineTab}
       </div>
       <div class="tab-pane chore-pane"${routineOnly ? " hidden" : ""}>
-        <div class="field"><label>Title</label><input type="text" class="f-title" placeholder="Take out the trash"></div>
+        <div class="field"><label data-fh-t="text.title">${__fhT("text.title", "Title", null, "h")}</label><input data-fh-placeholder="text.take_out_the_trash" type="text" class="f-title" placeholder="${__fhT("text.take_out_the_trash", "Take out the trash", null, "h")}"></div>
         <div class="field">
-          <label>Assignment mode</label>
+          <label data-fh-t="text.assignment_mode">${__fhT("text.assignment_mode", "Assignment mode", null, "h")}</label>
           <!-- buttons instead of a dropdown (see the
                ASSIGNMENT_MODES const's own comment) - the hidden native
                <select> right below stays the actual source of truth
@@ -4248,7 +4565,7 @@ class FamilyHubChoresCard extends HTMLElement {
              way to reach the same "sits unassigned, anyone can claim" end
              state - a real person is the only thing Direct mode should
              ever hand this field. -->
-        <div class="field f-direct-field"><label>Assigned to</label>
+        <div class="field f-direct-field"><label data-fh-t="text.assigned_to">${__fhT("text.assigned_to", "Assigned to", null, "h")}</label>
           <select class="f-assigned">${userOptions}</select>
         </div>
         <!-- Only
@@ -4331,13 +4648,13 @@ class FamilyHubChoresCard extends HTMLElement {
         <div class="field"><label>For</label><select class="g-assigned">${userOptions}</select></div>
         <div class="field"><label>Target count (how many times to log before it's done)</label><input type="number" class="g-target" min="1" value="1"></div>
         ${this._goalRewardFieldsHtml(null)}
-        <div class="field"><label>Due date (optional)</label><input type="datetime-local" class="g-due"></div>
-        <div class="field"><label>Notes</label><textarea class="g-notes" rows="3" placeholder="Any details worth knowing"></textarea></div>
+        <div class="field"><label data-fh-t="text.due_date_optional">${__fhT("text.due_date_optional", "Due date (optional)", null, "h")}</label><input type="datetime-local" class="g-due"></div>
+        <div class="field"><label data-fh-t="text.notes">${__fhT("text.notes", "Notes", null, "h")}</label><textarea data-fh-placeholder="text.any_details_worth_knowing" class="g-notes" rows="3" placeholder="${__fhT("text.any_details_worth_knowing", "Any details worth knowing", null, "h")}"></textarea></div>
       </div>
       ${this._routinesEnabled() ? `<div class="tab-pane routine-pane"${routineOnly ? "" : " hidden"}>${this._routineManagePaneHtml()}</div>` : ""}
       <div class="modal-actions">
-        <button class="cancel-btn">Cancel</button>
-        <button class="save-btn">Create</button>
+        <button data-fh-t="text.cancel" class="cancel-btn">${__fhT("text.cancel", "Cancel", null, "h")}</button>
+        <button data-fh-t="text.create" class="save-btn">${__fhT("text.create", "Create", null, "h")}</button>
       </div>
       <div class="form-error"></div>
     `;
@@ -4902,11 +5219,11 @@ class FamilyHubChoresCard extends HTMLElement {
     const titleInput = box.querySelector(".rm-add-title");
     const title = titleInput.value.trim();
     if (!personId) {
-      errEl.textContent = "Add someone to Family Hub first.";
+      errEl.textContent = __fhT("text.add_someone_to_family_hub_first", "Add someone to Family Hub first.");
       return;
     }
     if (!title) {
-      errEl.textContent = "A routine item needs a title.";
+      errEl.textContent = __fhT("text.a_routine_item_needs_a_title", "A routine item needs a title.");
       return;
     }
     const dueTime = box.querySelector(".rm-add-time").value || null;
@@ -4975,7 +5292,7 @@ class FamilyHubChoresCard extends HTMLElement {
     errEl.textContent = "";
     const title = row.querySelector(".rm-edit-title").value.trim();
     if (!title) {
-      errEl.textContent = "A routine item needs a title.";
+      errEl.textContent = __fhT("text.a_routine_item_needs_a_title", "A routine item needs a title.");
       return;
     }
     const dueTime = row.querySelector(".rm-edit-time").value || null;
@@ -5002,7 +5319,7 @@ class FamilyHubChoresCard extends HTMLElement {
         auto_complete_trigger: autoCompleteTrigger,
       });
     } catch (e) {
-      errEl.textContent = (e && e.message) || "Couldn't save this item.";
+      errEl.textContent = (e && e.message) || __fhT("text.couldn_t_save_this_item", "Couldn't save this item.");
       return;
     }
     this._routineManageEditingId = null;
@@ -5033,14 +5350,14 @@ class FamilyHubChoresCard extends HTMLElement {
       .map((it) => `<option value="${it.id}" ${g.reward_item_id === it.id ? "selected" : ""}>${this._esc(it.title)} (${it.cost_stars}&#11088;)</option>`)
       .join("");
     return `
-      <label>Reward
+      <label>${__fhT("text.reward", "Reward", null, "h")}
         <select class="g-reward-type">
-          <option value="stars" ${rewardType === "stars" ? "selected" : ""}>Stars</option>
-          <option value="catalog_item" ${rewardType === "catalog_item" ? "selected" : ""}>A specific reward from the catalog</option>
+          <option data-fh-t="text.stars" value="stars" ${rewardType === "stars" ? "selected" : ""}>${__fhT("text.stars", "Stars", null, "h")}</option>
+          <option data-fh-t="text.a_specific_reward_from_the_catalog" value="catalog_item" ${rewardType === "catalog_item" ? "selected" : ""}>${__fhT("text.a_specific_reward_from_the_catalog", "A specific reward from the catalog", null, "h")}</option>
         </select>
       </label>
-      <label class="g-star-value-field">How many stars<input type="number" class="g-star-value" min="1" value="${g.star_value || 1}"></label>
-      <label class="g-reward-item-field">Which reward<select class="g-reward-item">${catalogOptions}</select></label>
+      <label class="g-star-value-field">${__fhT("text.how_many_stars", "How many stars", null, "h")}<input type="number" class="g-star-value" min="1" value="${g.star_value || 1}"></label>
+      <label class="g-reward-item-field">${__fhT("text.which_reward", "Which reward", null, "h")}<select class="g-reward-item">${catalogOptions}</select></label>
     `;
   }
   _wireGoalRewardFields(box) {
@@ -5072,12 +5389,12 @@ class FamilyHubChoresCard extends HTMLElement {
     errEl.textContent = "";
     const title = box.querySelector(".g-title").value.trim();
     if (!title) {
-      errEl.textContent = "A goal needs a title.";
+      errEl.textContent = __fhT("text.a_goal_needs_a_title", "A goal needs a title.");
       return;
     }
     const assignedTo = box.querySelector(".g-assigned").value;
     if (!assignedTo) {
-      errEl.textContent = "A goal needs someone it belongs to.";
+      errEl.textContent = __fhT("text.a_goal_needs_someone_it_belongs_to", "A goal needs someone it belongs to.");
       return;
     }
     const payload = {
@@ -5093,7 +5410,7 @@ class FamilyHubChoresCard extends HTMLElement {
     try {
       await this._hass.connection.sendMessagePromise(payload);
     } catch (e) {
-      errEl.textContent = (e && e.message) || "Couldn't save this goal.";
+      errEl.textContent = (e && e.message) || __fhT("text.couldn_t_save_this_goal", "Couldn't save this goal.");
       return;
     }
     overlay.classList.remove("open");
@@ -5105,7 +5422,7 @@ class FamilyHubChoresCard extends HTMLElement {
     errEl.textContent = "";
     const title = box.querySelector(".f-title").value.trim();
     if (!title) {
-      errEl.textContent = "A chore needs a title.";
+      errEl.textContent = __fhT("text.a_chore_needs_a_title", "A chore needs a title.");
       return;
     }
     const mode = box.querySelector(".f-mode").value;
@@ -5174,7 +5491,7 @@ class FamilyHubChoresCard extends HTMLElement {
       };
     }
     if (payload.assigned_to_list && payload.assigned_to_list.length === 0) {
-      errEl.textContent = "Check at least one person to assign to multiple people.";
+      errEl.textContent = __fhT("text.check_at_least_one_person_to_assign_to", "Check at least one person to assign to multiple people.");
       return;
     }
     try {
@@ -5186,7 +5503,7 @@ class FamilyHubChoresCard extends HTMLElement {
       overlay.classList.remove("open");
       await this._fetchChores();
     } catch (e) {
-      errEl.textContent = (e && e.message) || "Couldn't create that chore - check the fields above.";
+      errEl.textContent = (e && e.message) || __fhT("text.couldn_t_create_that_chore_check_the", "Couldn't create that chore - check the fields above.");
     }
   }
 
@@ -5222,16 +5539,16 @@ class FamilyHubChoresCard extends HTMLElement {
     // reason to show (or let someone accidentally blank out) a rotation
     // group field on a chore that was never in that mode to begin with.
     const rotationFieldHtml = chore.assignment_mode === "auto_rotation"
-      ? `<label class="f-rotation-field">Rotation group (in order)<select class="f-rotation" multiple>${userOptions}</select></label>`
+      ? `<label class="f-rotation-field">${__fhT("text.rotation_group_in_order", "Rotation group (in order)", null, "h")}<select class="f-rotation" multiple>${userOptions}</select></label>`
       : "";
     box.innerHTML = `
-      <button type="button" class="modal-close edit-modal-close" aria-label="Close">&#10005;</button>
-      <h2>Edit chore</h2>
-      <div class="field"><label>Title</label><input type="text" class="f-title" value="${this._escAttr(chore.title)}"></div>
-      <div class="field"><label>Star value</label><input type="number" class="f-stars" min="0" value="${chore.star_value || 0}"></div>
-      <div class="field"><label>Due date</label><input type="datetime-local" class="f-due" value="${this._isoToLocalDatetimeInputValue(chore.due_date)}"></div>
+      <button data-fh-aria="text.close" type="button" class="modal-close edit-modal-close" aria-label="${__fhT("text.close", "Close", null, "h")}">&#10005;</button>
+      <h2 data-fh-t="text.edit_chore">${__fhT("text.edit_chore", "Edit chore", null, "h")}</h2>
+      <div class="field"><label data-fh-t="text.title">${__fhT("text.title", "Title", null, "h")}</label><input type="text" class="f-title" value="${this._escAttr(chore.title)}"></div>
+      <div class="field"><label data-fh-t="text.star_value">${__fhT("text.star_value", "Star value", null, "h")}</label><input type="number" class="f-stars" min="0" value="${chore.star_value || 0}"></div>
+      <div class="field"><label data-fh-t="text.due_date">${__fhT("text.due_date", "Due date", null, "h")}</label><input type="datetime-local" class="f-due" value="${this._isoToLocalDatetimeInputValue(chore.due_date)}"></div>
       ${this._remindFieldsHtml(chore)}
-      <div class="field"><label>Overdue penalty (stars)</label><input type="number" class="f-penalty" min="0" value="${chore.overdue_penalty || 0}"></div>
+      <div class="field"><label data-fh-t="text.overdue_penalty_stars">${__fhT("text.overdue_penalty_stars", "Overdue penalty (stars)", null, "h")}</label><input type="number" class="f-penalty" min="0" value="${chore.overdue_penalty || 0}"></div>
       <!-- - see the
            create modal's own copy of this comment for the full history
            (v198's Automate sub-tab, then v211's split into three sibling
@@ -5252,37 +5569,37 @@ class FamilyHubChoresCard extends HTMLElement {
              too, unlike assignment_mode/assigned_to just above (see this
              modal's own header comment). -->
         <div class="remind-check-row">
-          <label class="remind-check-opt"><input type="checkbox" class="f-important" ${chore.important ? "checked" : ""} /> <span class="chore-important-badge">&#10071;</span> Mark as important (always sorts to the top)</label>
+          <label class="remind-check-opt"><input type="checkbox" class="f-important" ${chore.important ? "checked" : ""} /> <span class="chore-important-badge">&#10071;</span> ${__fhT("text.mark_as_important_always_sorts_to_the", "Mark as important (always sorts to the top)", null, "h")}</label>
         </div>
         ${this._approvalToggleHtml("f-no-approval", !!chore.no_approval_required, !(this._canStarOverride() || chore.no_approval_required), "Only an admin (or someone granted star-override permission) can mark a chore as not requiring approval.")}
         ${this._alarmAudienceToggleHtml("f-alarm-audience", chore.alarm_audience)}
-        <div class="field" title="Optional - e.g. 3 for &quot;3 loads of laundry&quot;. Tapping Done counts down one unit at a time; only the last one triggers approval/stars. Changing this resets the current count."><label>Quantity (optional - e.g. 3 loads of laundry)</label><input type="number" class="f-quantity" min="1" placeholder="Leave blank for a normal chore" value="${chore.quantity_total || ""}"></div>
-        <div class="field" title="Optional - e.g. 30 for &quot;clean for 30 minutes&quot;. Adds a Start button to the chore; when the countdown runs out the chore completes itself exactly as if Done had been tapped, so it still respects whatever approval rules already apply."><label>Timer (optional - minutes)</label><input type="number" class="f-timer-minutes" min="1" max="1440" placeholder="Leave blank for no timer" value="${chore.timer_minutes || ""}"></div>
-        <div class="field"><label>Notes</label><textarea class="f-notes" rows="3" placeholder="Any details worth knowing - which bin, where to leave it, etc.">${this._esc(chore.notes || "")}</textarea></div>
-        <div class="field"><label>Depends on</label><select class="f-deps" multiple>${depOptions}</select></div>
+        <div class="field" title="Optional - e.g. 3 for &quot;3 loads of laundry&quot;. Tapping Done counts down one unit at a time; only the last one triggers approval/stars. Changing this resets the current count."><label data-fh-t="text.quantity_optional_e_g_3_loads_of_laundry">${__fhT("text.quantity_optional_e_g_3_loads_of_laundry", "Quantity (optional - e.g. 3 loads of laundry)", null, "h")}</label><input data-fh-placeholder="text.leave_blank_for_a_normal_chore" type="number" class="f-quantity" min="1" placeholder="${__fhT("text.leave_blank_for_a_normal_chore", "Leave blank for a normal chore", null, "h")}" value="${chore.quantity_total || ""}"></div>
+        <div class="field" title="Optional - e.g. 30 for &quot;clean for 30 minutes&quot;. Adds a Start button to the chore; when the countdown runs out the chore completes itself exactly as if Done had been tapped, so it still respects whatever approval rules already apply."><label data-fh-t="text.timer_optional_minutes">${__fhT("text.timer_optional_minutes", "Timer (optional - minutes)", null, "h")}</label><input data-fh-placeholder="text.leave_blank_for_no_timer" type="number" class="f-timer-minutes" min="1" max="1440" placeholder="${__fhT("text.leave_blank_for_no_timer", "Leave blank for no timer", null, "h")}" value="${chore.timer_minutes || ""}"></div>
+        <div class="field"><label data-fh-t="text.notes">${__fhT("text.notes", "Notes", null, "h")}</label><textarea data-fh-placeholder="text.any_details_worth_knowing_which_bin" class="f-notes" rows="3" placeholder="${__fhT("text.any_details_worth_knowing_which_bin", "Any details worth knowing - which bin, where to leave it, etc.", null, "h")}">${this._esc(chore.notes || "")}</textarea></div>
+        <div class="field"><label data-fh-t="text.depends_on">${__fhT("text.depends_on", "Depends on", null, "h")}</label><select class="f-deps" multiple>${depOptions}</select></div>
         ${rotationFieldHtml}
       </div>
       <button type="button" class="accordion-toggle" data-target="chore-edit-automate-body">
-        <span class="theme-section-label">Automate</span>
+        <span data-fh-t="text.automate" class="theme-section-label">${__fhT("text.automate", "Automate", null, "h")}</span>
         <span class="accordion-chevron">&#9660;</span>
       </button>
       <div class="accordion-body" id="chore-edit-automate-body">
         <fieldset>
-          <legend>Auto-create trigger (e.g. "Dryer finished")</legend>
-          <label>Entity ID<input type="text" class="f-create-entity" value="${this._escAttr(createTrigger.entity_id || "")}" placeholder="binary_sensor.dryer_done"></label>
-          <label>From state (optional)<input type="text" class="f-create-from" value="${this._escAttr(createTrigger.from_state || "")}" placeholder="running"></label>
-          <label>To state<input type="text" class="f-create-to" value="${this._escAttr(createTrigger.to_state || "")}" placeholder="off"></label>
+          <legend data-fh-t="text.auto_create_trigger_e_g_dryer_finished">${__fhT("text.auto_create_trigger_e_g_dryer_finished", "Auto-create trigger (e.g. \"Dryer finished\")", null, "h")}</legend>
+          <label>${__fhT("text.entity_id", "Entity ID", null, "h")}<input type="text" class="f-create-entity" value="${this._escAttr(createTrigger.entity_id || "")}" placeholder="binary_sensor.dryer_done"></label>
+          <label>${__fhT("text.from_state_optional", "From state (optional)", null, "h")}<input type="text" class="f-create-from" value="${this._escAttr(createTrigger.from_state || "")}" placeholder="running"></label>
+          <label>${__fhT("text.to_state", "To state", null, "h")}<input type="text" class="f-create-to" value="${this._escAttr(createTrigger.to_state || "")}" placeholder="off"></label>
         </fieldset>
         <fieldset>
-          <legend>Auto-complete trigger (e.g. "Dishwasher opened")</legend>
-          <label>Entity ID<input type="text" class="f-complete-entity" value="${this._escAttr(completeTrigger.entity_id || "")}" placeholder="binary_sensor.dishwasher_door"></label>
-          <label>From state (optional)<input type="text" class="f-complete-from" value="${this._escAttr(completeTrigger.from_state || "")}" placeholder="closed"></label>
-          <label>To state<input type="text" class="f-complete-to" value="${this._escAttr(completeTrigger.to_state || "")}" placeholder="open"></label>
+          <legend data-fh-t="text.auto_complete_trigger_e_g_dishwasher">${__fhT("text.auto_complete_trigger_e_g_dishwasher", "Auto-complete trigger (e.g. \"Dishwasher opened\")", null, "h")}</legend>
+          <label>${__fhT("text.entity_id", "Entity ID", null, "h")}<input type="text" class="f-complete-entity" value="${this._escAttr(completeTrigger.entity_id || "")}" placeholder="binary_sensor.dishwasher_door"></label>
+          <label>${__fhT("text.from_state_optional", "From state (optional)", null, "h")}<input type="text" class="f-complete-from" value="${this._escAttr(completeTrigger.from_state || "")}" placeholder="closed"></label>
+          <label>${__fhT("text.to_state", "To state", null, "h")}<input type="text" class="f-complete-to" value="${this._escAttr(completeTrigger.to_state || "")}" placeholder="open"></label>
         </fieldset>
       </div>
       <div class="modal-actions">
-        <button class="cancel-btn">Cancel</button>
-        <button class="save-btn">Save</button>
+        <button data-fh-t="text.cancel" class="cancel-btn">${__fhT("text.cancel", "Cancel", null, "h")}</button>
+        <button data-fh-t="text.save" class="save-btn">${__fhT("text.save", "Save", null, "h")}</button>
       </div>
       <div class="form-error"></div>
     `;
@@ -5302,7 +5619,7 @@ class FamilyHubChoresCard extends HTMLElement {
     errEl.textContent = "";
     const title = box.querySelector(".f-title").value.trim();
     if (!title) {
-      errEl.textContent = "A chore needs a title.";
+      errEl.textContent = __fhT("text.a_chore_needs_a_title", "A chore needs a title.");
       return;
     }
     const payload = {
@@ -5375,7 +5692,7 @@ class FamilyHubChoresCard extends HTMLElement {
       overlay.classList.remove("open");
       await this._fetchChores();
     } catch (e) {
-      errEl.textContent = (e && e.message) || "Couldn't save that chore - check the fields above.";
+      errEl.textContent = (e && e.message) || __fhT("text.couldn_t_save_that_chore_check_the", "Couldn't save that chore - check the fields above.");
     }
   }
 
@@ -5395,8 +5712,17 @@ class FamilyHubChoresCard extends HTMLElement {
            would resolve to nothing and every box-shadow using it would
            silently vanish. */
         --fc-shadow: 0 2px 5px rgba(58, 53, 44, 0.16); }
-      ha-card { background: var(--fc-bg); color: var(--fc-text); padding: 12px; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+      ha-card { background: var(--fc-bg); background-image: var(--fc-bg-overlay-image, none), var(--fc-bg-image, none); background-size: cover, var(--fc-bg-size, cover); background-position: center, var(--fc-bg-position, center); color: var(--fc-text); padding: 12px; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
       .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+      /* v1.168.62: calendar-style person pills (same look as the Family Week
+         Calendar card's legend chips) */
+      .person-pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 0 0 10px; }
+      .person-pills[hidden] { display: none; }
+      .person-pill { display: flex; align-items: center; gap: 6px; padding: 4px 10px 4px 4px; border: none; border-radius: 16px; font: inherit; font-size: 13px; font-weight: 600; color: #3a352c; box-shadow: var(--fc-shadow, 0 2px 8px rgba(58,53,44,0.12)); cursor: pointer; transition: opacity 0.15s ease; -webkit-tap-highlight-color: transparent; }
+      .person-pill.active-filter { outline: 2px solid var(--fc-accent); outline-offset: 1px; }
+      .person-pill.dimmed { opacity: 0.4; }
+      .person-pill-avatar { width: 20px; height: 20px; border-radius: 50%; background: rgba(0,0,0,0.2); display: flex; align-items: center; justify-content: center; font-size: 11px; color: #fff; font-weight: 700; }
+      .person-pill-count { font-weight: 700; }
       .title { font-size: 18px; font-weight: 800; }
       .actions { display: flex; gap: 8px; }
       /* Same pixel-for-pixel treatment as family-week-calendar-card.js's own
@@ -5434,12 +5760,8 @@ class FamilyHubChoresCard extends HTMLElement {
       .kiosk-login-empty { color: var(--fc-text-secondary); font-size: 13px; }
       .kiosk-login-pin-input { width: 100%; box-sizing: border-box; font-size: 22px; letter-spacing: 6px; text-align: center; padding: 10px; border-radius: 10px; border: 1px solid var(--fc-border); background: var(--fc-card); color: var(--fc-text); }
       .kiosk-login-error { color: #b3462c; font-size: 13px; min-height: 18px; margin-top: 6px; }
-      /* Not .active until Waiting to Recur is actually collapsed to this
-         bar button (see _toggleWaitingToRecurCollapsed) - the reverse of
-         .rewards-toggle-btn's own active meaning ("shown"), since here the
-         button itself IS the collapsed state, not a way into a hidden one. */
-      .waiting-recur-toggle-btn { border: 1px solid var(--fc-border); border-radius: 12px; padding: 6px 12px; font-size: 12px; font-weight: 700; background: var(--fc-surface-alt); color: var(--fc-text); cursor: pointer; }
-      .waiting-recur-toggle-btn.active { background: #8fa7b3; color: #fff; border-color: #8fa7b3; }
+      .compact-view-toggle-btn { border: 1px solid var(--fc-border); border-radius: 12px; padding: 6px 10px; font-size: 13px; font-weight: 700; background: var(--fc-surface-alt); color: var(--fc-text); cursor: pointer; }
+      .compact-view-toggle-btn.active { background: var(--fc-accent); color: var(--fc-accent-text); border-color: var(--fc-accent); }
       .board { flex: 1; display: flex; gap: 10px; overflow-x: auto; overflow-y: hidden; }
       /* min-width, not a fixed width: with room to spare (few columns) each
          column grows equally to fill the dashboard instead of leaving empty
@@ -5454,6 +5776,7 @@ class FamilyHubChoresCard extends HTMLElement {
       .chore-col-body { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
       .chore-col-body.drag-over { background: var(--fc-surface-alt); }
       .chore-col-empty { text-align: center; color: var(--fc-text-secondary); font-size: 12px; padding: 12px 0; }
+      .just-me-empty { align-self: flex-start; max-width: 360px; color: var(--fc-text-secondary); font-size: 13px; padding: 16px; background: var(--fc-card); border-radius: 12px; }
       .routines-block { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid var(--fc-border); }
       .routine-row { background: var(--fc-surface2); border-radius: 8px; overflow: hidden; }
       .routine-row-header { display: flex; align-items: center; gap: 6px; padding: 6px 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
@@ -5604,6 +5927,22 @@ class FamilyHubChoresCard extends HTMLElement {
       .chore-title { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
       .chore-meta { display: flex; gap: 8px; font-size: 12px; color: var(--fc-text-secondary); flex-wrap: wrap; }
       .chore-actions { margin-top: 6px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      /* Household ask, verbatim: "If there are so many chores on a list
+         that they turn into a scrolling list, maybe we should have a more
+         compact view." A per-device toggle (see _compactViewEnabled) that
+         shrinks every card's own padding/font rather than hiding any
+         chore - due date/streak/quantity stay, just smaller, so a long
+         column shows noticeably more of itself per scroll without losing
+         information. Scoped under .board.compact-view so a card's OWN
+         status/important styling above still applies unchanged. */
+      .board.compact-view .chore-card { padding: 5px 8px; border-radius: 8px; }
+      .board.compact-view .chore-col-body { gap: 5px; padding: 6px; }
+      .board.compact-view .chore-title { font-size: 12.5px; margin-bottom: 2px; }
+      .board.compact-view .chore-meta { font-size: 10.5px; gap: 6px; }
+      .board.compact-view .chore-actions { margin-top: 4px; gap: 4px; }
+      .board.compact-view .chore-actions button { padding: 3px 7px; font-size: 11px; }
+      .board.compact-view .chore-rejected-badge,
+      .board.compact-view .chore-timer-live { font-size: 10.5px; padding: 2px 6px; }
       /* chore timers. Start reads as a secondary action next to
          Done (which stays primary - finishing early is always allowed);
          once running it's replaced by a live countdown chip, monospace-ish
@@ -5614,6 +5953,8 @@ class FamilyHubChoresCard extends HTMLElement {
       .chore-timer-cancel-btn { background: transparent !important; color: var(--fc-text-secondary) !important; padding: 4px 6px !important; }
       .chore-actions button { border: none; border-radius: 8px; padding: 5px 10px; font-size: 12px; font-weight: 700; cursor: pointer; background: var(--fc-accent2); color: #fff; }
       .chore-nudge-btn { background: var(--fc-surface-alt) !important; color: var(--fc-text) !important; }
+      .chore-in-progress-btn { background: var(--fc-surface-alt) !important; color: var(--fc-text) !important; }
+      .chore-in-progress-btn.is-active { background: var(--fc-accent2) !important; color: #fff !important; }
       .chore-edit-btn { background: var(--fc-surface-alt) !important; color: var(--fc-text) !important; }
       .chore-approve-btn { background: var(--fc-accent) !important; color: var(--fc-accent-text) !important; }
       .chore-reject-btn { background: var(--fc-surface-alt) !important; color: var(--fc-accent3) !important; }
@@ -5789,8 +6130,40 @@ class FamilyHubChoresCardEditor extends HTMLElement {
   }
   set hass(hass) {
     this._hass = hass;
+    if (!this._peopleOptions && !this._peopleOptionsLoading && hass) this._fetchPeopleOptions();
     if (!this._themeOptions) this._fetchThemeOptions();
     else this._render();
+  }
+  // v1.168.63: household members for the "People on this card" list -
+  // Family Hub members (memberUserIds) by name, fetched once.
+  async _fetchPeopleOptions() {
+    this._peopleOptionsLoading = true;
+    // v1.168.66: "Just me" first - whoever is signed in (or PIN-logged-in
+    // on a kiosk) at the time, instead of a fixed person.
+    const options = [{ value: "me", label: "Just me (whoever is signed in)" }];
+    try {
+      const [usersRes, settingsRes] = await Promise.all([
+        this._hass.connection.sendMessagePromise({ type: "family_hub/list_users" }).catch(() => null),
+        this._hass.connection.sendMessagePromise({ type: "family_hub/get_settings" }).catch(() => null),
+      ]);
+      const users = (usersRes && Array.isArray(usersRes.users)) ? usersRes.users : [];
+      const settings = (settingsRes && settingsRes.settings) || {};
+      const members = Array.isArray(settings.memberUserIds) && settings.memberUserIds.length ? new Set(settings.memberUserIds) : null;
+      users
+        .filter((u) => u && u.id && (!members || members.has(u.id)))
+        .forEach((u) => options.push({ value: u.id, label: u.name || u.id }));
+        options.push({ value: "chore_bin", label: "Chore Bin" });
+    } catch (e) {
+      // leave the list empty - the option still works from YAML
+    }
+    // keep any already-chosen id visible even if it isn't a member any more,
+    // so saving the editor never silently drops it
+    ((this._config && Array.isArray(this._config.people)) ? this._config.people : []).forEach((id) => {
+      if (!options.some((o) => o.value === id)) options.push({ value: id, label: id + " (not found)" });
+    });
+    this._peopleOptions = options;
+    this._peopleOptionsLoading = false;
+    this._render();
   }
   async _fetchThemeOptions() {
     this._themeOptions = [{ value: "", label: "Use device settings (default)" }];
@@ -5825,6 +6198,11 @@ class FamilyHubChoresCardEditor extends HTMLElement {
         ] } },
       },
       {
+        name: "people",
+        selector: { select: { multiple: true, mode: "list", options: this._peopleOptions || [] } },
+      },
+      { name: "show_waiting_to_recur", selector: { boolean: {} } },
+      {
         name: "theme_override",
         selector: { select: { mode: "dropdown", options: this._themeOptions || [{ value: "", label: "Use device settings (default)" }] } },
       },
@@ -5841,15 +6219,20 @@ class FamilyHubChoresCardEditor extends HTMLElement {
       this.appendChild(this._form);
     }
     this._form.hass = this._hass;
-    this._form.data = this._config || {};
+    // show_waiting_to_recur defaults ON (absent = on), so show it that way
+    this._form.data = { show_waiting_to_recur: true, ...(this._config || {}) };
     this._form.schema = this._schema();
     this._form.computeLabel = (s) => (
       s.name === "title" ? "Title" :
       s.name === "fab_position" ? "+ button position" :
-      s.name === "theme_override" ? "Theme" : undefined
+      s.name === "theme_override" ? "Theme" :
+      s.name === "people" ? "People on this card" :
+      s.name === "show_waiting_to_recur" ? "Show Waiting to Recur" : undefined
     );
     this._form.computeHelper = (s) => (
-      s.name === "theme_override"
+      s.name === "people"
+        ? "Only these people get a spot (and a name pill) on this card. \"Just me\" means whoever is signed in (on a kiosk, whoever logged in with their PIN). Leave everything unchecked to show everyone."
+        : s.name === "theme_override"
         ? "Pin this one card to a specific theme, or leave on \"Use device settings\" to follow whatever this device/household normally shows."
         : undefined
     );
